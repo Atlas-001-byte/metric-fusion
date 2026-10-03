@@ -1,5 +1,5 @@
 """Metric Fusion package."""
 
-from .core import process
+from .core import ExplanationStore, alert_fingerprint, process
 
-__all__ = ["process"]
+__all__ = ["process", "ExplanationStore", "alert_fingerprint"]
