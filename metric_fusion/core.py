@@ -11,6 +11,8 @@ from typing import Any
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
 
+AGGREGATION_FUNCTIONS = ("avg", "min", "max", "sum", "last")
+
 _ALERT_FIELDS = ("source", "name", "labels", "alert_id", "rule", "timestamp_ms", "severity")
 
 
@@ -97,7 +99,61 @@ def _validate_alert(alert: Any, seen_ids: set) -> dict:
     }
 
 
-def _downsample(metrics: list, downsample_ms: int) -> list:
+def _validate_aggregations(raw: Any) -> dict:
+    """Validate an ``aggregations`` mapping of exact metric name to function.
+
+    Returns ``{}`` for an absent/None mapping (every metric uses ``avg``).
+    Anything that is not a mapping of non-empty string keys to one of the
+    supported function names raises ``ValueError("invalid aggregation")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid aggregation")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid aggregation")
+        if not (isinstance(value, str) and value in AGGREGATION_FUNCTIONS):
+            raise ValueError("invalid aggregation")
+        validated[key] = value
+    return validated
+
+
+def _new_bucket() -> dict:
+    return {"sum": 0.0, "count": 0, "sources": set(), "min": None, "max": None, "last": None}
+
+
+def _bucket_add(bucket: dict, source: str, timestamp_ms: Any, value: Any) -> None:
+    bucket["sum"] += value
+    bucket["count"] += 1
+    bucket["sources"].add(source)
+    if bucket["min"] is None or value < bucket["min"]:
+        bucket["min"] = value
+    if bucket["max"] is None or value > bucket["max"]:
+        bucket["max"] = value
+    last = bucket["last"]
+    # "last" is the sample with the greatest timestamp; ties resolve to the
+    # lexicographically greatest source.
+    if last is None or (timestamp_ms, source) > (last[0], last[1]):
+        bucket["last"] = (timestamp_ms, source, value)
+
+
+def _bucket_value(bucket: dict, func: str) -> float:
+    if func == "min":
+        value = bucket["min"]
+    elif func == "max":
+        value = bucket["max"]
+    elif func == "sum":
+        value = bucket["sum"]
+    elif func == "last":
+        value = bucket["last"][2]
+    else:  # avg
+        value = bucket["sum"] / bucket["count"]
+    return round(value + 0.0, 6)  # normalize -0.0
+
+
+def _downsample(metrics: list, downsample_ms: int, aggregations: dict | None = None) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
     points: dict = {}
@@ -117,24 +173,21 @@ def _downsample(metrics: list, downsample_ms: int) -> list:
         bucket_key = (name, labels_key, start)
         bucket = buckets.get(bucket_key)
         if bucket is None:
-            bucket = {"sum": 0.0, "count": 0, "sources": set()}
+            bucket = _new_bucket()
             buckets[bucket_key] = bucket
-        bucket["sum"] += value
-        bucket["count"] += 1
-        bucket["sources"].add(source)
+        _bucket_add(bucket, source, timestamp_ms, value)
 
     series = []
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
         bucket = buckets[(name, labels_key, start)]
-        count = bucket["count"]
-        mean = bucket["sum"] / count + 0.0  # normalize -0.0
+        func = aggregations.get(name, "avg") if aggregations else "avg"
         series.append(
             {
                 "name": name,
                 "labels": json.loads(labels_key),
                 "timestamp_ms": start,
-                "value": round(mean, 6),
-                "count": count,
+                "value": _bucket_value(bucket, func),
+                "count": bucket["count"],
                 "sources": sorted(bucket["sources"]),
             }
         )
@@ -452,6 +505,10 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
     if not _is_int(suppression_ms) or suppression_ms < 0:
         raise ValueError("invalid suppression_ms")
 
+    # Per-metric aggregation selection; validated before any state is touched
+    # so a failure leaves nothing partially applied.
+    aggregations = _validate_aggregations(request.get("aggregations"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -477,7 +534,7 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
     seen_ids: set = set()
     alerts = [_validate_alert(alert, seen_ids) for alert in raw_alerts]
 
-    series = _downsample(metrics, downsample_ms)
+    series = _downsample(metrics, downsample_ms, aggregations)
     result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, suppression_ms)
 
     if not enabled:
@@ -739,7 +796,7 @@ class MetricBatchService:
         return rank, candidates[rank]
 
     def _recompute_bucket(self, bucket_key: tuple) -> None:
-        bucket = {"sum": 0.0, "count": 0, "sources": set()}
+        bucket = _new_bucket()
         live_points = set()
         for point_key in self._bucket_points[bucket_key]:
             winner = self._point_winner(point_key)
@@ -747,9 +804,7 @@ class MetricBatchService:
                 continue
             live_points.add(point_key)
             _rank, metric = winner
-            bucket["sum"] += metric["value"]
-            bucket["count"] += 1
-            bucket["sources"].add(metric["source"])
+            _bucket_add(bucket, metric["source"], metric["timestamp_ms"], metric["value"])
         if bucket["count"] == 0:
             # No winning samples remain: the window disappears from queries.
             self._bucket_points.pop(bucket_key, None)
@@ -861,12 +916,15 @@ class MetricBatchService:
         labels: dict | None = None,
         start_ms: Any = None,
         end_ms: Any = None,
+        aggregations: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
         Optional filters: exact metric name, label subset match, and a
-        ``[start_ms, end_ms]`` range over window start times. Output rows keep
-        the existing fields and the existing (name, labels, timestamp) order.
+        ``[start_ms, end_ms]`` range over window start times. ``aggregations``
+        maps exact metric names to ``avg``/``min``/``max``/``sum``/``last``;
+        unmapped metrics keep the default ``avg``. Output rows keep the
+        existing fields and the existing (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
             raise ValueError("invalid name")
@@ -875,6 +933,7 @@ class MetricBatchService:
         for bound in (start_ms, end_ms):
             if bound is not None and not _valid_timestamp(bound):
                 raise ValueError("invalid time range")
+        agg_map = _validate_aggregations(aggregations)
 
         rows = []
         for (bucket_name, labels_key, start), bucket in self._buckets.items():
@@ -889,13 +948,12 @@ class MetricBatchService:
                 continue
             if end_ms is not None and start > end_ms:
                 continue
-            mean = bucket["sum"] / bucket["count"] + 0.0  # normalize -0.0
             rows.append(
                 {
                     "name": bucket_name,
                     "labels": bucket_labels,
                     "timestamp_ms": start,
-                    "value": round(mean, 6),
+                    "value": _bucket_value(bucket, agg_map.get(bucket_name, "avg")),
                     "count": bucket["count"],
                     "sources": sorted(bucket["sources"]),
                 }

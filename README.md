@@ -34,6 +34,15 @@ python -m metric_fusion request.json > result.json
 - 告警按 `rule + 序列键` 分组，组内按 timestamp_ms、alert_id 排序：首条发出；距最近发出不超过 `suppression_ms` 且级别不更高者抑制；更高级别重置起点并发出。输出各告警的 `alert_id/severity/suppressed` 及 `suppressed_alert_ids`。
 - 校验错误消息：`invalid request`、`invalid metric`、`invalid value`、`invalid alert`、`invalid severity`、`duplicate alert_id`、`invalid downsample_ms`、`invalid suppression_ms`、`invalid JSON`。
 
+## 按指标选择窗口聚合函数（可选）
+
+`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `aggregations` 映射：键为精确指标名，值只能是 `avg`、`min`、`max`、`sum`、`last`。未命中映射的指标仍用 `avg`，未提供 `aggregations` 时行为与基线完全一致。
+
+- 去重（`source/name/labels/timestamp_ms` 后覆盖先）与窗口起点（`timestamp_ms // downsample_ms * downsample_ms`）不变；同 `name` + 规范 labels 的窗口内：`avg/min/max/sum` 分别取平均、最小、最大、总和；`last` 取 `timestamp_ms` 最大的样本，时间相同取 `source` 字典序最大者。
+- 输出字段不变（`name/labels/timestamp_ms/value/count/sources`，不增加聚合类型字段），`count` 仍是去重样本数，`sources` 去重排序，`value` 仍 `round(value, 6)` 且 `-0.0` 统一为 `0`；排序不变。
+- 有状态服务在补丁、迟到修正与批次撤回后按当前胜者样本重算所选函数；批次秩、幂等、`affected_streams`、`recomputed_windows`、告警重裁与顺序无关语义不变。聚合只影响选定的 series 查询：`GET /v1/series`、`GET /v1/alerts` 与告警抑制不读取该配置。
+- 校验：`aggregations` 不是字符串到允许函数名的映射、键为空串或值不支持时，库调用抛 `ValueError("invalid aggregation")`；HTTP 返回 400，`{"code": "invalid_request", "message": "invalid aggregation"}`；CLI 输出该消息并以 2 退出。校验失败不部分修改状态。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。

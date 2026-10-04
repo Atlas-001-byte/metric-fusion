@@ -125,6 +125,7 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                             labels=body.get("labels"),
                             start_ms=body.get("start_ms"),
                             end_ms=body.get("end_ms"),
+                            aggregations=body.get("aggregations"),
                         )
                 except BatchError as exc:
                     _send_error(self, exc.status, exc.code, str(exc))
