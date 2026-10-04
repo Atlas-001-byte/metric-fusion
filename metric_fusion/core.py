@@ -11,6 +11,9 @@ from typing import Any
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
 
+# Per-metric, per-window aggregate functions. Unconfigured metrics use "avg".
+AGG_FUNCTIONS = ("avg", "min", "max", "sum", "last")
+
 _ALERT_FIELDS = ("source", "name", "labels", "alert_id", "rule", "timestamp_ms", "severity")
 
 
@@ -28,6 +31,66 @@ def _canonical_labels(labels: dict) -> str:
 
 def _valid_timestamp(value: Any) -> bool:
     return _is_number(value) and math.isfinite(value) and value >= 0
+
+
+def _validate_aggregations(raw: Any) -> dict:
+    """Validate an exact-metric-name -> aggregate-function mapping.
+
+    Absent aggregations stay on the historical average; a present but
+    malformed mapping is rejected wholesale with a fixed message.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("invalid aggregation")
+    aggregations = {}
+    for name, func in raw.items():
+        if not (isinstance(name, str) and name != ""):
+            raise ValueError("invalid aggregation")
+        if func not in AGG_FUNCTIONS:
+            raise ValueError("invalid aggregation")
+        aggregations[name] = func
+    return aggregations
+
+
+def _new_bucket() -> dict:
+    # Statistics over a window's winning samples. Every supported aggregate
+    # derivable here, so per-metric function selection costs nothing extra on
+    # patch/late-data/retraction recomputation.
+    return {
+        "sum": 0.0,
+        "count": 0,
+        "sources": set(),
+        "min": None,
+        "max": None,
+        "last": None,  # (timestamp_ms, source, value) of the newest sample
+    }
+
+
+def _bucket_add(bucket: dict, metric: dict) -> None:
+    value = metric["value"]
+    bucket["sum"] += value
+    bucket["count"] += 1
+    bucket["sources"].add(metric["source"])
+    if bucket["min"] is None or value < bucket["min"]:
+        bucket["min"] = value
+    if bucket["max"] is None or value > bucket["max"]:
+        bucket["max"] = value
+    candidate = (metric["timestamp_ms"], metric["source"], value)
+    if bucket["last"] is None or candidate[:2] > bucket["last"][:2]:
+        bucket["last"] = candidate
+
+
+def _aggregate_value(bucket: dict, func: str):
+    if func == "avg":
+        value = bucket["sum"] / bucket["count"]
+    elif func == "min":
+        value = bucket["min"]
+    elif func == "max":
+        value = bucket["max"]
+    elif func == "sum":
+        value = bucket["sum"]
+    else:  # "last"
+        value = bucket["last"][2]
+    return round(value + 0.0, 6)  # normalize -0.0 to 0
 
 
 def _validate_metric(metric: Any) -> dict:
@@ -97,7 +160,7 @@ def _validate_alert(alert: Any, seen_ids: set) -> dict:
     }
 
 
-def _downsample(metrics: list, downsample_ms: int) -> list:
+def _downsample(metrics: list, downsample_ms: int, aggregations: dict | None = None) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
     points: dict = {}
@@ -109,32 +172,31 @@ def _downsample(metrics: list, downsample_ms: int) -> list:
             labels_key,
             metric["timestamp_ms"],
         )
-        points[point_key] = metric["value"]
+        points[point_key] = metric
 
     buckets: dict = {}
-    for (source, name, labels_key, timestamp_ms), value in points.items():
-        start = (timestamp_ms // downsample_ms) * downsample_ms
+    for metric in points.values():
+        name = metric["name"]
+        labels_key = _canonical_labels(metric["labels"])
+        start = (metric["timestamp_ms"] // downsample_ms) * downsample_ms
         bucket_key = (name, labels_key, start)
         bucket = buckets.get(bucket_key)
         if bucket is None:
-            bucket = {"sum": 0.0, "count": 0, "sources": set()}
+            bucket = _new_bucket()
             buckets[bucket_key] = bucket
-        bucket["sum"] += value
-        bucket["count"] += 1
-        bucket["sources"].add(source)
+        _bucket_add(bucket, metric)
 
+    functions = {} if aggregations is None else aggregations
     series = []
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
         bucket = buckets[(name, labels_key, start)]
-        count = bucket["count"]
-        mean = bucket["sum"] / count + 0.0  # normalize -0.0
         series.append(
             {
                 "name": name,
                 "labels": json.loads(labels_key),
                 "timestamp_ms": start,
-                "value": round(mean, 6),
-                "count": count,
+                "value": _aggregate_value(bucket, functions.get(name, "avg")),
+                "count": bucket["count"],
                 "sources": sorted(bucket["sources"]),
             }
         )
@@ -451,6 +513,14 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
     suppression_ms = request.get("suppression_ms")
     if not _is_int(suppression_ms) or suppression_ms < 0:
         raise ValueError("invalid suppression_ms")
+    # Validate before anything is produced or recorded: a malformed mapping
+    # must never leave a partial state.
+    aggregations_raw = request.get("aggregations")
+    aggregations = (
+        {}
+        if aggregations_raw is None
+        else _validate_aggregations(aggregations_raw)
+    )
 
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
@@ -477,7 +547,7 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
     seen_ids: set = set()
     alerts = [_validate_alert(alert, seen_ids) for alert in raw_alerts]
 
-    series = _downsample(metrics, downsample_ms)
+    series = _downsample(metrics, downsample_ms, aggregations)
     result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, suppression_ms)
 
     if not enabled:
@@ -590,7 +660,7 @@ class MetricBatchService:
         # retracting the winning batch can restore the next-highest rank.
         self._points: dict = {}  # point_key -> {rank: metric}
         self._bucket_points: dict = {}  # bucket_key -> set of point_key
-        self._buckets: dict = {}  # bucket_key -> {sum, count, sources}
+        self._buckets: dict = {}  # bucket_key -> window statistics
         self._alerts: list = []
         self._alert_ids: set = set()
         self._registry.clear()
@@ -739,7 +809,7 @@ class MetricBatchService:
         return rank, candidates[rank]
 
     def _recompute_bucket(self, bucket_key: tuple) -> None:
-        bucket = {"sum": 0.0, "count": 0, "sources": set()}
+        bucket = _new_bucket()
         live_points = set()
         for point_key in self._bucket_points[bucket_key]:
             winner = self._point_winner(point_key)
@@ -747,9 +817,7 @@ class MetricBatchService:
                 continue
             live_points.add(point_key)
             _rank, metric = winner
-            bucket["sum"] += metric["value"]
-            bucket["count"] += 1
-            bucket["sources"].add(metric["source"])
+            _bucket_add(bucket, metric)
         if bucket["count"] == 0:
             # No winning samples remain: the window disappears from queries.
             self._bucket_points.pop(bucket_key, None)
@@ -861,12 +929,16 @@ class MetricBatchService:
         labels: dict | None = None,
         start_ms: Any = None,
         end_ms: Any = None,
+        aggregations: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
         Optional filters: exact metric name, label subset match, and a
-        ``[start_ms, end_ms]`` range over window start times. Output rows keep
-        the existing fields and the existing (name, labels, timestamp) order.
+        ``[start_ms, end_ms]`` range over window start times. ``aggregations``
+        maps exact metric names to ``avg/min/max/sum/last``; metrics absent
+        from the mapping keep the historical average. Output rows keep the
+        existing fields (never the function used) and the existing
+        (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
             raise ValueError("invalid name")
@@ -875,6 +947,9 @@ class MetricBatchService:
         for bound in (start_ms, end_ms):
             if bound is not None and not _valid_timestamp(bound):
                 raise ValueError("invalid time range")
+        functions = (
+            {} if aggregations is None else _validate_aggregations(aggregations)
+        )
 
         rows = []
         for (bucket_name, labels_key, start), bucket in self._buckets.items():
@@ -889,13 +964,12 @@ class MetricBatchService:
                 continue
             if end_ms is not None and start > end_ms:
                 continue
-            mean = bucket["sum"] / bucket["count"] + 0.0  # normalize -0.0
             rows.append(
                 {
                     "name": bucket_name,
                     "labels": bucket_labels,
                     "timestamp_ms": start,
-                    "value": round(mean, 6),
+                    "value": _aggregate_value(bucket, functions.get(bucket_name, "avg")),
                     "count": bucket["count"],
                     "sources": sorted(bucket["sources"]),
                 }

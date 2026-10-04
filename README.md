@@ -31,8 +31,10 @@ python -m metric_fusion request.json > result.json
 
 - 指标按 `source/name/labels/timestamp_ms` 去重（后覆盖先），以 `name + 规范 labels`（labels 键排序）为序列键。
 - 同桶（桶起点为 `timestamp_ms // downsample_ms * downsample_ms`）跨 source 取均值，收集去重来源，输出桶起点、`round(value, 6)` 的均值、样本数与来源；series 按 name、规范 labels、timestamp_ms 排序。
+- 可选 `aggregations`：精确指标名到窗口聚合函数的映射，值仅允许 `avg`、`min`、`max`、`sum`、`last`；未出现在映射中的指标（以及不传该字段时）仍取平均。同 `name + 规范 labels` 的窗口内，`avg/min/max/sum` 分别为去重样本值的平均、最小、最大与总和；`last` 取 `timestamp_ms` 最大的样本，时间相同取 `source` 字典序最大者。输出字段不变（仍为 `name/labels/timestamp_ms/value/count/sources`，不包含所用聚合函数）；`count` 始终是去重后参与窗口的样本数，`sources` 去重排序，`value` 仍 `round(value, 6)` 且正零统一为 `0`。
+- `aggregations` 不是字符串到允许函数名的映射、键为空字符串、值不在允许集合内或类型错误时，库调用抛 `ValueError("invalid aggregation")`；校验失败不产生任何输出或部分状态修改。
 - 告警按 `rule + 序列键` 分组，组内按 timestamp_ms、alert_id 排序：首条发出；距最近发出不超过 `suppression_ms` 且级别不更高者抑制；更高级别重置起点并发出。输出各告警的 `alert_id/severity/suppressed` 及 `suppressed_alert_ids`。
-- 校验错误消息：`invalid request`、`invalid metric`、`invalid value`、`invalid alert`、`invalid severity`、`duplicate alert_id`、`invalid downsample_ms`、`invalid suppression_ms`、`invalid JSON`。
+- 校验错误消息：`invalid request`、`invalid metric`、`invalid value`、`invalid alert`、`invalid severity`、`duplicate alert_id`、`invalid downsample_ms`、`invalid suppression_ms`、`invalid aggregation`、`invalid JSON`。命令行校验失败时把消息写入标准错误并以退出码 2 结束。
 
 ## 抑制解释（可选开启）
 
@@ -117,9 +119,13 @@ result = service.apply_batch({
 
 ```python
 service.query_series(name="cpu.usage", labels={"host": "db-1"},
-                     start_ms=0, end_ms=119000)   # 过滤均可省略
+                     start_ms=0, end_ms=119000,   # 过滤均可省略
+                     aggregations={"cpu.usage": "last", "net.bytes": "sum"})
 service.query_alerts()   # 对当前已存告警重新裁决抑制，修正后结果随之变化
 ```
+
+- `query_series` 可选 `aggregations`（精确指标名到 `avg/min/max/sum/last` 的映射，未命中指标与不传时仍为 `avg`）；输出字段、排序、`count` 与 `sources` 语义与无状态入口一致，不包含聚合函数字段。映射不合法时抛 `ValueError("invalid aggregation")`，且不改变任何状态。
+- 窗口在内部始终基于当前胜者样本维护全部聚合所需统计，因此补丁应用、迟到修正与批次撤回后按当前胜者样本重算所选函数；批次秩、幂等、`affected_streams`、`recomputed_windows`、告警重裁与顺序无关语义均不变（这些计数仍只按既有均值是否变化判定）。聚合只影响显式选定的 series 查询：`query_alerts()`、`GET /v1/series`、`GET /v1/alerts` 未配置聚合时保持既有均值行为。
 
 批次可附带 `alerts`（沿用既有告警校验），服务累积存储并在每次 `query_alerts()` 时重新裁决，因此修正后不再满足抑制条件的结果会反映在后续查询中。`service.reset()` 清空全部状态。
 
@@ -130,7 +136,7 @@ python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-m
 ```
 
 - `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；`POST /v1/metric_batches/{batch_id}/retract`：撤回批次（请求体可空，若有则须为可识别 JSON）。错误响应为 `{"code": ..., "message": ...}`，状态码如上。
-- `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。
+- `POST /process`：旧版无状态入口，请求体可带 `aggregations`。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series，可在请求体中带 `aggregations` 按指标选择 `avg/min/max/sum/last`（未命中仍为均值）；映射不合法时返回 HTTP 400，`code` 为 `invalid_request`，`message` 固定为 `invalid aggregation`。`GET /v1/series`、`GET /v1/alerts`：全量查询，不接受聚合配置，保持既有均值输出。
 
 ## 约定
 
