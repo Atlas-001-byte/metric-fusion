@@ -489,3 +489,297 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
 
     target_registry = _default_registry if registry is None else registry
     return _process_with_explanations(alerts, series, rules, target_registry)
+
+
+# ---------------------------------------------------------------------------
+# Metric batch patches and late-data correction
+# ---------------------------------------------------------------------------
+
+BATCH_APPLIED = "applied"
+
+
+class BatchError(ValueError):
+    """Structured batch-API failure carrying an HTTP status and a stable code."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+def _canonical_sample(metric: dict) -> str:
+    return json.dumps(
+        {
+            "source": metric["source"],
+            "name": metric["name"],
+            "labels": metric["labels"],
+            "timestamp_ms": metric["timestamp_ms"],
+            "value": metric["value"],
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_alert(alert: dict) -> str:
+    return json.dumps(
+        {field: alert[field] for field in _ALERT_FIELDS},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _batch_fingerprint(max_event_time_ms: Any, metrics: list, alerts: list) -> str:
+    """Content fingerprint of a batch, independent of sample ordering."""
+    payload = "\n".join(
+        ["v1", repr(max_event_time_ms)]
+        + sorted(_canonical_sample(metric) for metric in metrics)
+        + ["--"]
+        + sorted(_canonical_alert(alert) for alert in alerts)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class MetricBatchService:
+    """Stateful metric-stream store accepting idempotent, order-independent batches.
+
+    Samples are kept per stream so that late batches recompute exactly the
+    downsample windows they touch; queries always reflect the current state.
+    Point conflicts across batches resolve deterministically by batch rank
+    ``(max_event_time_ms, batch_id)`` — the higher rank wins — so the final
+    aggregates do not depend on batch arrival order.
+    """
+
+    def __init__(
+        self,
+        downsample_ms: int | None = None,
+        suppression_ms: int = 0,
+        suppression_rules: list | None = None,
+        enable_explanations: bool = False,
+        registry: ExplanationRegistry | None = None,
+    ) -> None:
+        if downsample_ms is not None and (not _is_int(downsample_ms) or downsample_ms <= 0):
+            raise ValueError("invalid downsample_ms")
+        if not _is_int(suppression_ms) or suppression_ms < 0:
+            raise ValueError("invalid suppression_ms")
+        if not isinstance(enable_explanations, bool):
+            raise ValueError("invalid enable_explanations")
+        rules: list = []
+        if enable_explanations:
+            raw_rules = [] if suppression_rules is None else suppression_rules
+            if not isinstance(raw_rules, list):
+                raise ValueError("invalid suppression rules")
+            seen_rule_ids: set = set()
+            rules = [_validate_suppression_rule(raw, seen_rule_ids) for raw in raw_rules]
+
+        self._downsample_ms = downsample_ms
+        self._suppression_ms = suppression_ms
+        self._enable_explanations = enable_explanations
+        self._rules = rules
+        self._registry = ExplanationRegistry() if registry is None else registry
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop all applied batches, samples, windows and alerts."""
+        self._batches: dict = {}  # batch_id -> content fingerprint
+        self._points: dict = {}  # point_key -> (rank, metric)
+        self._bucket_points: dict = {}  # bucket_key -> set of point_key
+        self._buckets: dict = {}  # bucket_key -> {sum, count, sources}
+        self._alerts: list = []
+        self._alert_ids: set = set()
+        self._registry.clear()
+
+    # -- validation ---------------------------------------------------------
+
+    def _validate_sample(self, raw: Any) -> dict:
+        if not isinstance(raw, dict):
+            raise BatchError(400, "metric_batch_invalid", "invalid metric")
+        # A sample whose timestamp is not a usable epoch-millis value cannot be
+        # assigned to any downsample window; it must not be dropped silently.
+        if not _valid_timestamp(raw.get("timestamp_ms")):
+            raise BatchError(422, "metric_window_unresolved", "metric window unresolved")
+        try:
+            return _validate_metric(raw)
+        except ValueError as exc:
+            raise BatchError(400, "metric_batch_invalid", str(exc)) from exc
+
+    # -- batch application --------------------------------------------------
+
+    def apply_batch(self, request: dict) -> dict:
+        """Apply one metric batch, or delegate legacy requests to ``process``.
+
+        A request without ``batch_id`` is handled by the original stateless
+        entry point with unchanged behavior. With ``batch_id`` the batch is
+        validated as a whole, deduplicated by content, and merged into the
+        stored streams; affected windows are recomputed immediately.
+        """
+        if not isinstance(request, dict):
+            raise BatchError(400, "metric_batch_invalid", "invalid request")
+        batch_id = request.get("batch_id")
+        if batch_id is None:
+            return process(request)
+        if not (isinstance(batch_id, str) and batch_id != ""):
+            raise BatchError(400, "metric_batch_invalid", "invalid batch_id")
+
+        max_event_time_ms = request.get("max_event_time_ms")
+        if not _valid_timestamp(max_event_time_ms):
+            raise BatchError(400, "metric_batch_invalid", "invalid max_event_time_ms")
+
+        raw_metrics = request.get("metrics")
+        if not isinstance(raw_metrics, list):
+            raise BatchError(400, "metric_batch_invalid", "invalid request")
+        metrics = [self._validate_sample(raw) for raw in raw_metrics]
+
+        raw_alerts = request.get("alerts", [])
+        if raw_alerts is None:
+            raw_alerts = []
+        if not isinstance(raw_alerts, list):
+            raise BatchError(400, "metric_batch_invalid", "invalid request")
+        seen_ids: set = set()
+        alerts = []
+        for raw in raw_alerts:
+            try:
+                alerts.append(_validate_alert(raw, seen_ids))
+            except ValueError as exc:
+                raise BatchError(400, "metric_batch_invalid", str(exc))
+        if any(alert["alert_id"] in self._alert_ids for alert in alerts):
+            raise BatchError(400, "metric_batch_invalid", "duplicate alert_id")
+
+        if metrics:
+            if self._downsample_ms is None:
+                raise BatchError(422, "metric_window_unresolved", "metric window unresolved")
+            window_start = (max_event_time_ms // self._downsample_ms) * self._downsample_ms
+            for metric in metrics:
+                timestamp_ms = metric["timestamp_ms"]
+                if timestamp_ms < window_start or timestamp_ms > max_event_time_ms:
+                    raise BatchError(
+                        400, "metric_batch_range_invalid", "metric batch range invalid"
+                    )
+
+        fingerprint = _batch_fingerprint(max_event_time_ms, metrics, alerts)
+        known = self._batches.get(batch_id)
+        if known is not None:
+            if known == fingerprint:
+                # Full duplicate: report success with nothing re-applied.
+                return {
+                    "batch_id": batch_id,
+                    "status": BATCH_APPLIED,
+                    "affected_streams": 0,
+                    "recomputed_windows": 0,
+                }
+            raise BatchError(409, "metric_batch_conflict", "metric batch conflict")
+
+        rank = (max_event_time_ms, batch_id)
+        # Within one batch, identical points dedupe with the later one winning.
+        batch_points: dict = {}
+        for metric in metrics:
+            point_key = (
+                metric["source"],
+                metric["name"],
+                _canonical_labels(metric["labels"]),
+                metric["timestamp_ms"],
+            )
+            batch_points[point_key] = metric
+
+        affected_streams: set = set()
+        affected_buckets: set = set()
+        for point_key, metric in batch_points.items():
+            existing = self._points.get(point_key)
+            if existing is not None and existing[0] >= rank:
+                continue  # a newer-or-equal batch already owns this point
+            self._points[point_key] = (rank, metric)
+            labels_key = point_key[2]
+            start = (point_key[3] // self._downsample_ms) * self._downsample_ms
+            bucket_key = (point_key[1], labels_key, start)
+            self._bucket_points.setdefault(bucket_key, set()).add(point_key)
+            affected_streams.add((point_key[1], labels_key))
+            affected_buckets.add(bucket_key)
+
+        for bucket_key in affected_buckets:
+            self._recompute_bucket(bucket_key)
+
+        self._batches[batch_id] = fingerprint
+        self._alerts.extend(alerts)
+        self._alert_ids.update(alert["alert_id"] for alert in alerts)
+
+        return {
+            "batch_id": batch_id,
+            "status": BATCH_APPLIED,
+            "affected_streams": len(affected_streams),
+            "recomputed_windows": len(affected_buckets),
+        }
+
+    def _recompute_bucket(self, bucket_key: tuple) -> None:
+        bucket = {"sum": 0.0, "count": 0, "sources": set()}
+        for point_key in self._bucket_points[bucket_key]:
+            _rank, metric = self._points[point_key]
+            bucket["sum"] += metric["value"]
+            bucket["count"] += 1
+            bucket["sources"].add(metric["source"])
+        self._buckets[bucket_key] = bucket
+
+    # -- queries --------------------------------------------------------------
+
+    def query_series(
+        self,
+        name: str | None = None,
+        labels: dict | None = None,
+        start_ms: Any = None,
+        end_ms: Any = None,
+    ) -> list:
+        """Return current downsampled windows in the established output shape.
+
+        Optional filters: exact metric name, label subset match, and a
+        ``[start_ms, end_ms]`` range over window start times. Output rows keep
+        the existing fields and the existing (name, labels, timestamp) order.
+        """
+        if name is not None and not isinstance(name, str):
+            raise ValueError("invalid name")
+        if labels is not None and not isinstance(labels, dict):
+            raise ValueError("invalid labels")
+        for bound in (start_ms, end_ms):
+            if bound is not None and not _valid_timestamp(bound):
+                raise ValueError("invalid time range")
+
+        rows = []
+        for (bucket_name, labels_key, start), bucket in self._buckets.items():
+            if name is not None and bucket_name != name:
+                continue
+            bucket_labels = json.loads(labels_key)
+            if labels is not None and any(
+                bucket_labels.get(key) != value for key, value in labels.items()
+            ):
+                continue
+            if start_ms is not None and start < start_ms:
+                continue
+            if end_ms is not None and start > end_ms:
+                continue
+            mean = bucket["sum"] / bucket["count"] + 0.0  # normalize -0.0
+            rows.append(
+                {
+                    "name": bucket_name,
+                    "labels": bucket_labels,
+                    "timestamp_ms": start,
+                    "value": round(mean, 6),
+                    "count": bucket["count"],
+                    "sources": sorted(bucket["sources"]),
+                }
+            )
+        rows.sort(key=lambda row: (row["name"], _canonical_labels(row["labels"]), row["timestamp_ms"]))
+        return rows
+
+    def query_alerts(self) -> dict:
+        """Re-adjudicate all stored alerts against the current configuration.
+
+        Suppression is recomputed on every query, so corrections that change
+        the stored alert set are reflected in subsequent results.
+        """
+        alerts = list(self._alerts)
+        if self._enable_explanations:
+            return _process_with_explanations(
+                alerts, self.query_series(), self._rules, self._registry
+            )
+        result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, self._suppression_ms)
+        return {"alerts": result_alerts, "suppressed_alert_ids": suppressed_alert_ids}

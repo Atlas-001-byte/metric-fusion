@@ -70,6 +70,53 @@ query_explanations(fingerprint="...", now_ms=60000)  # 指定当前时间
 - 另有 `ExplanationRegistry`（可传给 `process(..., registry=)` 以隔离状态）与 `reset_explanations()`。
 - 开启模式下的新增校验错误：`invalid suppression rules`、`invalid suppression rule`、`invalid rule_id`、`duplicate rule_id`、`invalid selector`、`invalid enable_explanations`。任何校验失败均抛 `ValueError` 且本次处理不产生任何输出或解释记录。
 
+## 指标批次补丁与迟到修正（有状态服务）
+
+`MetricBatchService` 在内存中维护指标流状态，接受带批次标识的指标样本批次，支持幂等应用与迟到数据修正；不增加任何落盘文件或持久化入口。
+
+```python
+from metric_fusion import MetricBatchService, BatchError
+
+service = MetricBatchService(downsample_ms=60000, suppression_ms=30000)
+result = service.apply_batch({
+    "batch_id": "batch-001",
+    "max_event_time_ms": 119000,
+    "metrics": [
+        {"source": "agent-a", "name": "cpu.usage",
+         "labels": {"host": "db-1"}, "timestamp_ms": 61000, "value": 0.5},
+    ],
+})
+# => {"batch_id": "batch-001", "status": "applied",
+#     "affected_streams": 1, "recomputed_windows": 1}
+```
+
+- 批次样本沿用既有指标字段（`source/name/labels/timestamp_ms/value`）与校验；批次另需 `batch_id`（非空字符串）与 `max_event_time_ms`。未提供 `batch_id` 的请求按原有 `process` 入口的原方式处理，行为完全不变。
+- 样本时间戳必须落在批次窗口内：`[max_event_time_ms // downsample_ms * downsample_ms, max_event_time_ms]`，否则整批拒绝，HTTP 400，`code` 固定为 `metric_batch_range_invalid`。
+- 时间戳不可用（非数值、非有限、为负）或服务未配置 `downsample_ms` 时，样本归属窗口无法确定，整批拒绝，HTTP 422，`code` 固定为 `metric_window_unresolved`，样本不会被静默丢弃。
+- 幂等：同一 `batch_id` 重复到达且内容（样本集合与最大事件时间，与样本顺序无关）相同，视为成功，返回相同状态 `applied`，但 `affected_streams` 与 `recomputed_windows` 均为 0；内容不同则整批拒绝，HTTP 409，`code` 固定为 `metric_batch_conflict`。
+- 应用成功返回 `batch_id`、`status`（`applied`）、`affected_streams`（受影响的 `name + 规范 labels` 流数量）、`recomputed_windows`（重算的降采样窗口数量）。迟到样本落入已查询过的窗口时，该窗口立即按当前样本集重算，后续查询返回修正值。
+- 跨批次同一数据点（`source/name/labels/timestamp_ms`）冲突按批次秩 `(max_event_time_ms, batch_id)` 确定胜者，与到达顺序无关；因此批次到达顺序不影响最终聚合值，同一输入集合重复执行结果相同。
+- 其他校验失败（结构、字段、重复 `alert_id` 等）返回 HTTP 400，`code` 为 `metric_batch_invalid`，`message` 沿用既有校验消息。所有失败均为整批拒绝，不产生部分效果。
+
+查询（结果始终反映当前状态，排序与窗口边界与既有输出一致）：
+
+```python
+service.query_series(name="cpu.usage", labels={"host": "db-1"},
+                     start_ms=0, end_ms=119000)   # 过滤均可省略
+service.query_alerts()   # 对当前已存告警重新裁决抑制，修正后结果随之变化
+```
+
+批次可附带 `alerts`（沿用既有告警校验），服务累积存储并在每次 `query_alerts()` 时重新裁决，因此修正后不再满足抑制条件的结果会反映在后续查询中。`service.reset()` 清空全部状态。
+
+HTTP 服务（仅内存状态）：
+
+```bash
+python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-ms 30000
+```
+
+- `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；错误响应为 `{"code": ..., "message": ...}`，状态码如上。
+- `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。
+
 ## 约定
 
 - 公开行为以 README 与源码为准。
