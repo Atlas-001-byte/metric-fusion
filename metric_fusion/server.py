@@ -18,6 +18,7 @@ from .core import (
     MaintenanceWindowError,
     MetricBatchService,
     RuleConfigurationError,
+    SourceWeightError,
     process,
 )
 
@@ -26,6 +27,7 @@ RETRACT_SUFFIX = "/retract"
 WINDOW_RULES_PATH = "/v1/window_suppression_rules"
 WINDOW_SUPPRESSIONS_PATH = "/v1/window_suppressions"
 MAINTENANCE_WINDOWS_PATH = "/v1/maintenance_windows"
+SOURCE_WEIGHTS_PATH = "/v1/source_weights"
 
 
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -92,6 +94,19 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             else:
                 _send_json(self, 200, {"status": "ok"})
 
+        def _handle_source_weights(self) -> None:
+            try:
+                body = self._read_json()
+                weights = body.get("source_weights") if isinstance(body, dict) else body
+                with lock:
+                    service.set_source_weights(weights)
+            except BatchError as exc:
+                _send_error(self, exc.status, exc.code, str(exc))
+            except SourceWeightError as exc:
+                _send_error(self, 400, "invalid_source_weights", str(exc))
+            else:
+                _send_json(self, 200, {"status": "ok"})
+
         def _retract_batch_id(self, path: str) -> str | None:
             """Extract a batch_id from the retract path, or None if malformed.
 
@@ -138,6 +153,8 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 self._handle_window_rules()
             elif path == MAINTENANCE_WINDOWS_PATH:
                 self._handle_maintenance_windows()
+            elif path == SOURCE_WEIGHTS_PATH:
+                self._handle_source_weights()
             elif path.startswith(RETRACT_PREFIX):
                 batch_id = self._retract_batch_id(path)
                 if batch_id is None:
@@ -160,6 +177,8 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                     _send_error(self, 400, "event_timestamp_error", str(exc))
                 except MaintenanceWindowError as exc:
                     _send_error(self, 400, "invalid_maintenance_window", str(exc))
+                except SourceWeightError as exc:
+                    _send_error(self, 400, "invalid_source_weights", str(exc))
                 except ValueError as exc:
                     _send_error(self, 400, "invalid_request", str(exc))
                 else:
@@ -178,12 +197,24 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                             aggregations=body.get("aggregations"),
                             source_quorum=body.get("source_quorum"),
                         )
+                        payload = {"series": series}
+                        # Weight-missing markers are reported only while at
+                        # least one weight-enabled target is configured.
+                        if service.source_weights:
+                            payload["weight_missing_windows"] = (
+                                service.query_weight_missing_windows(
+                                    name=body.get("name"),
+                                    labels=body.get("labels"),
+                                    start_ms=body.get("start_ms"),
+                                    end_ms=body.get("end_ms"),
+                                )
+                            )
                 except BatchError as exc:
                     _send_error(self, exc.status, exc.code, str(exc))
                 except ValueError as exc:
                     _send_error(self, 400, "invalid_request", str(exc))
                 else:
-                    _send_json(self, 200, {"series": series})
+                    _send_json(self, 200, payload)
             else:
                 _send_error(self, 404, "not_found", "not found")
 
@@ -193,6 +224,8 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 self._handle_window_rules()
             elif path == MAINTENANCE_WINDOWS_PATH:
                 self._handle_maintenance_windows()
+            elif path == SOURCE_WEIGHTS_PATH:
+                self._handle_source_weights()
             else:
                 _send_error(self, 404, "not_found", "not found")
 
@@ -224,7 +257,12 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                     _send_json(self, 200, service.query_alerts())
             elif self.path == "/v1/series":
                 with lock:
-                    _send_json(self, 200, {"series": service.query_series()})
+                    payload = {"series": service.query_series()}
+                    if service.source_weights:
+                        payload["weight_missing_windows"] = (
+                            service.query_weight_missing_windows()
+                        )
+                    _send_json(self, 200, payload)
             else:
                 _send_error(self, 404, "not_found", "not found")
 

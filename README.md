@@ -53,6 +53,55 @@ python -m metric_fusion request.json > result.json
 - 查询范围、`name` 与 `labels` 过滤及排序继续沿用当前口径。`GET /v1/series`、`GET /v1/alerts` 与告警抑制（含抑制解释、时间窗规则）不读取 `source_quorum`；批次应用/撤回请求也不接受该配置，其行为与响应字段不变。
 - 校验：`source_quorum` 必须是字符串到正整数的映射，键非空，值不能为布尔值、零、负数或浮点数；非法时库调用抛 `ValueError("invalid source_quorum")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_quorum"}`，CLI 输出 `invalid source_quorum` 并以 2 退出。校验失败不改变已有状态。
 
+## 按指标目标的源权重归并（可选）
+
+`process` 接受可选的 `source_weights` 映射，按指标目标选择参与来源并为每个来源设置权重；`MetricBatchService` 通过构造参数 `source_weights=` 或 `service.set_source_weights(...)` 加载同一配置。未提供配置（或空映射）时继续使用等权重均值，提交、查询、降采样边界、标签、序列标识与告警抑制行为与基线完全一致；**只有显式列出的指标目标**进入加权逻辑，未列出的目标维持现有等权聚合。
+
+配置形如（目标值支持两种等价写法）：
+
+```json
+{
+  "cpu.usage": {"agent-a": 1, "agent-b": 3, "agent-c": 0},
+  "net.rx": [
+    {"source": "agent-a", "weight": 2.5},
+    {"source": "agent-b", "weight": 0.5}
+  ]
+}
+```
+
+- 外层键为精确指标目标名（非空字符串）；内层选择参与来源，并给每个来源一个**大于等于零的有限数值权重**（整数或浮点均可，布尔值、NaN、无穷与负数非法）。
+- 同一目标允许只列出部分已知来源：**未列出的来源不贡献值**（其样本既不计入数值也不计入可用性）。条目列表形式用于需要显式表达来源顺序的场景，也是唯一能观察到“同一来源重复配置”的形式；映射形式与列表形式在校验后等价。
+- 目标至少配置一个来源；目标来源集合为空即配置非法。
+
+### 加权结果
+
+窗口对齐、窗口起点（`timestamp_ms // downsample_ms * downsample_ms`）、时间粒度、标签与序列标识（`name + 规范 labels + 窗口起点`）与现有降采样完全一致，去重（`source/name/labels/timestamp_ms` 后覆盖先）、同窗口重复提交与来源迟到语义也不因权重功能改变。
+
+- **权重大于零**的来源：窗口内每个去重后有效样本以其值乘以来源权重计入加权和，权重计入有效权重之和。同一来源在同一窗口有多个不同时间戳的去重点时，各点照常分别计入。
+- 查询已启用权重的目标时，返回值等价于该窗口所有有效参与值的加权和除以有效权重之和：`Σ(value × weight) / Σ(weight)`，并沿用 `round(value, 6)` 与 `-0.0 → 0` 归一。
+- **权重为零**的来源只计入可用性（出现在 `sources` 中），不改变加权和与有效权重之和，也不计入 `count`（`count` 仍为正权重去重点数）。
+- 部分来源缺失时，只按窗口内实际出现的参与来源归一；窗口内没有任何样本时继续沿用现有无数据语义（无行、无标记）。
+- 可与 `source_quorum` 同时使用：覆盖度按全部参与来源（含零权重来源）判断；达不到阈值的窗口不输出值行。加权目标不套用 `aggregations` 的 `min/max/sum/last`，其归并值即上述加权结果；`aggregations` 只作用于未启用权重的目标。告警及其抑制（含解释、时间窗规则、维护窗口）不读取权重配置。
+
+### 权重缺失窗口
+
+窗口有样本但不产生数值结果时标记为**权重缺失**，响应新增 `weight_missing_windows`（仅在启用了至少一个加权目标时出现），每条含 `name`、`labels`、`timestamp_ms`（窗口起点），排序与 series 一致。以下三种情况标记权重缺失且不输出值行：
+
+1. 窗口内只有权重为零的来源；
+2. 有效权重之和为零；
+3. 窗口样本全部来自该目标配置不允许的来源。
+
+窗口内没有任何样本时不属于权重缺失，沿用现有无数据语义（不出现在 series 也不出现在缺失列表）。
+
+有状态服务提供 `service.query_weight_missing_windows(name=, labels=, start_ms=, end_ms=)`，过滤参数与 `query_series` 一致；来源迟到、批次补丁或撤回导致窗口在“有值”与“权重缺失”之间变化时，受影响窗口立即重算，撤回的 `recomputed_windows`/`affected_streams` 把该变化计入。
+
+### 配置加载、替换与错误
+
+- `MetricBatchService(source_weights={...})` 在构造时加载；`service.set_source_weights(weights)` 全量替换（`None` 清空，恢复等权重），替换为**整批校验、全有或全无**：非法配置抛 `SourceWeightError` 且旧配置与已存窗口保持不变；接受新配置后已存窗口按新配置重算。`service.reset()` 清空数据但保留权重配置。
+- 统一错误类型 `SourceWeightError`（`ValueError` 子类），消息固定为 `invalid source_weights`：权重为负、非有限数（NaN/无穷）、权重为布尔值或非数值、同一来源重复配置（条目列表形式）、目标来源集合为空、目标名为空等均抛出该异常，并且**不加载任何部分配置**。
+- 样本阶段缺少来源、指标目标或时间戳，或数值非有限数时，沿用现有样本校验：无状态 `process` 抛 `ValueError`（`invalid metric`/`invalid value`），批次接口整批拒绝（HTTP 400，`code` 为 `metric_batch_invalid`；时间戳无法归属窗口为 422 `metric_window_unresolved`），已接受的其他样本与既有查询结果不受影响。
+- HTTP：`PUT`/`POST /v1/source_weights`（请求体为配置映射或 `{"source_weights": {...}}`，整体替换）成功返回 `{"status": "ok"}`；配置非法返回 400，`{"code": "invalid_source_weights", "message": "invalid source_weights"}`。`POST /v1/query` 与 `GET /v1/series` 在已加载加权配置时额外返回 `weight_missing_windows`；`POST /process` 在请求携带 `source_weights` 时于响应中返回该字段。权重功能不新增任何落盘行为，不改变当前公开入口、普通默认目标、降采样边界与告警抑制规则及其兼容行为。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。

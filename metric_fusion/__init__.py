@@ -7,6 +7,7 @@ from .core import (
     MaintenanceWindowError,
     MetricBatchService,
     RuleConfigurationError,
+    SourceWeightError,
     WindowSuppressionEngine,
     alert_fingerprint,
     process,
@@ -28,6 +29,7 @@ __all__ = [
     "RuleConfigurationError",
     "EventTimestampError",
     "MaintenanceWindowError",
+    "SourceWeightError",
     "query_window_suppressions",
     "reset_window_suppressions",
 ]
