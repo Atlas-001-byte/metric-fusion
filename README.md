@@ -79,6 +79,48 @@ query_explanations(fingerprint="...", now_ms=60000)  # 指定当前时间
 - 另有 `ExplanationRegistry`（可传给 `process(..., registry=)` 以隔离状态）与 `reset_explanations()`。
 - 开启模式下的新增校验错误：`invalid suppression rules`、`invalid suppression rule`、`invalid rule_id`、`duplicate rule_id`、`invalid selector`、`invalid enable_explanations`。任何校验失败均抛 `ValueError` 且本次处理不产生任何输出或解释记录。
 
+## 时间窗抑制规则（按来源与标签维度，可选）
+
+在请求中加入 `window_suppression_rules`（规则列表）即启用；缺省不提供时，输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。规则由公开配置入口输入，在下一次事件进入前生效。
+
+规则形如：
+
+```json
+{
+  "rule_id": "cpu-flap",
+  "source": "agent-a",
+  "metric": "cpu.*",
+  "labels": {"host": "db-1"},
+  "pending_ms": 30000,
+  "suppression_ms": 60000,
+  "recovery_ms": 45000
+}
+```
+
+- `source` 为非空字符串，精确匹配来源；`metric` 为精确指标名或含 `*` 的通配；`labels` 为标签等值条件（可省略），需全部命中。`pending_ms`（持续时长）、`suppression_ms`（抑制时长）、`recovery_ms`（恢复时长）均为非负整数，单位毫秒，沿用项目现有时间口径。
+- 判定以事件时间和规则维度为准。同一规则对同一 `来源 + 规范 labels` 组合的连续匹配自首次命中起累计，跨度达到 `pending_ms` 时立即进入 `suppressed`，抑制结束时间为触发时刻加 `suppression_ms`；抑制窗口不因重复样本延长。抑制时长结束后进入恢复观察：恢复期内再次命中只重新开始观察（记录中的抑制结束时间不变），只有安静度过完整 `recovery_ms` 才回到未命中。不同标签组合互不影响。
+- 规则命中时不删除原始观测：样本与归并结果沿既有路径流动，原本应发出的告警被标记为 `suppressed`（与既有抑制判定取并集，`suppressed_alert_ids` 随之更新）。同一事件同时命中多条规则时，每条规则各自保留一条状态（按 `rule_id` 升序），告警的汇总抑制结果以最早结束的抑制窗口为准。
+- 重复提交同一事件与同一规则不会产生重复窗口或相互矛盾的状态（每个 `rule_id + source + labels` 组合至多一条状态记录）。
+
+查询结果每条包含 `rule_id`、`source`、`labels`、`active_start_ms`（活跃开始时间）、`suppression_end_ms`（抑制结束时间，尚未进入抑制时为 `null`）与 `status`：`missed`（未命中）、`pending`（观察中）、`suppressed`（抑制中）、`recovered`（已恢复，即恢复观察期）。
+
+```python
+from metric_fusion import (
+    WindowSuppressionEngine, process,
+    query_window_suppressions, reset_window_suppressions,
+)
+
+result = process({..., "window_suppression_rules": [...]})
+result["suppression_states"]          # 本次启用时响应新增该字段
+query_window_suppressions(rule_id="cpu-flap", now_ms=60000)
+```
+
+- `process(..., window_engine=)` 可传入自定义 `WindowSuppressionEngine` 以隔离状态；默认使用进程级引擎，因此跨调用的历史状态仍可查询。`MetricBatchService(window_suppression_rules=[...])`、`service.set_window_suppression_rules(rules)`（整体替换，校验全有或全无）、`service.query_suppression_states(rule_id=, source=, labels=, now_ms=)` 提供同样的能力；批次请求也可携带 `window_suppression_rules` 在该批事件记录前生效。`service.reset()` 清空已记录状态但保留规则配置；批次撤回不改写抑制历史。
+- 查询的 `now_ms` 缺省取引擎已见的最大事件时间；状态判定始终基于事件时间而非墙钟。
+- 修改 `pending_ms` / `suppression_ms` / `recovery_ms` 不追溯已经记录的命中；删除规则仅停止后续匹配，历史抑制状态仍可按 `rule_id` 查询。
+- 错误：时间戳缺失、持续时长为负、抑制时长或恢复时长为负、来源为空、指标名匹配条件为空、标签匹配条件非法（含 `rule_id` 为空或重复）统一抛 `RuleConfigurationError`；处理事件遇到无法排序的时间戳（非数值、非有限或为负）抛 `EventTimestampError`。两者均为 `ValueError` 子类；校验失败为整批拒绝，不产生部分效果。HTTP 下分别返回 400，`code` 为 `rule_configuration_error` / `event_timestamp_error`。
+- HTTP：`PUT`/`POST /v1/window_suppression_rules`（请求体为规则列表或 `{"rules": [...]}`，整体替换配置）；`GET /v1/window_suppressions?rule_id=&source=&now_ms=` 返回 `{"suppression_states": [...]}`。
+
 ## 指标批次补丁与迟到修正（有状态服务）
 
 `MetricBatchService` 在内存中维护指标流状态，接受带批次标识的指标样本批次，支持幂等应用与迟到数据修正；不增加任何落盘文件或持久化入口。

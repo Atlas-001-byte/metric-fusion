@@ -2,12 +2,17 @@
 
 from .core import (
     BatchError,
+    EventTimestampError,
     ExplanationRegistry,
     MetricBatchService,
+    RuleConfigurationError,
+    WindowSuppressionEngine,
     alert_fingerprint,
     process,
     query_explanations,
+    query_window_suppressions,
     reset_explanations,
+    reset_window_suppressions,
 )
 
 __all__ = [
@@ -18,4 +23,9 @@ __all__ = [
     "reset_explanations",
     "MetricBatchService",
     "BatchError",
+    "WindowSuppressionEngine",
+    "RuleConfigurationError",
+    "EventTimestampError",
+    "query_window_suppressions",
+    "reset_window_suppressions",
 ]

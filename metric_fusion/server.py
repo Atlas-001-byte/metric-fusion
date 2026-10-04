@@ -10,12 +10,20 @@ import argparse
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-from .core import BatchError, MetricBatchService, process
+from .core import (
+    BatchError,
+    EventTimestampError,
+    MetricBatchService,
+    RuleConfigurationError,
+    process,
+)
 
 RETRACT_PREFIX = "/v1/metric_batches/"
 RETRACT_SUFFIX = "/retract"
+WINDOW_RULES_PATH = "/v1/window_suppression_rules"
+WINDOW_SUPPRESSIONS_PATH = "/v1/window_suppressions"
 
 
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -47,10 +55,25 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                     result = service.apply_batch(self._read_json())
             except BatchError as exc:
                 _send_error(self, exc.status, exc.code, str(exc))
+            except RuleConfigurationError as exc:
+                _send_error(self, 400, "rule_configuration_error", str(exc))
             except ValueError as exc:  # legacy path validation errors
                 _send_error(self, 400, "invalid_request", str(exc))
             else:
                 _send_json(self, 200, result)
+
+        def _handle_window_rules(self) -> None:
+            try:
+                body = self._read_json()
+                rules = body.get("rules") if isinstance(body, dict) else body
+                with lock:
+                    service.set_window_suppression_rules(rules)
+            except BatchError as exc:
+                _send_error(self, exc.status, exc.code, str(exc))
+            except RuleConfigurationError as exc:
+                _send_error(self, 400, "rule_configuration_error", str(exc))
+            else:
+                _send_json(self, 200, {"status": "ok"})
 
         def _retract_batch_id(self, path: str) -> str | None:
             """Extract a batch_id from the retract path, or None if malformed.
@@ -94,6 +117,8 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             path = urlsplit(self.path).path
             if path == "/v1/metric_batches":
                 self._handle_batch()
+            elif path == WINDOW_RULES_PATH:
+                self._handle_window_rules()
             elif path.startswith(RETRACT_PREFIX):
                 batch_id = self._retract_batch_id(path)
                 if batch_id is None:
@@ -110,6 +135,10 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                     result = process(self._read_json())
                 except BatchError as exc:
                     _send_error(self, exc.status, exc.code, str(exc))
+                except RuleConfigurationError as exc:
+                    _send_error(self, 400, "rule_configuration_error", str(exc))
+                except EventTimestampError as exc:
+                    _send_error(self, 400, "event_timestamp_error", str(exc))
                 except ValueError as exc:
                     _send_error(self, 400, "invalid_request", str(exc))
                 else:
@@ -136,8 +165,36 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             else:
                 _send_error(self, 404, "not_found", "not found")
 
+        def do_PUT(self) -> None:  # noqa: N802 - stdlib handler API
+            if urlsplit(self.path).path == WINDOW_RULES_PATH:
+                self._handle_window_rules()
+            else:
+                _send_error(self, 404, "not_found", "not found")
+
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-            if self.path == "/v1/alerts":
+            split = urlsplit(self.path)
+            if split.path == WINDOW_SUPPRESSIONS_PATH:
+                params = parse_qs(split.query)
+                now_raw = params.get("now_ms", [None])[0]
+                try:
+                    now_ms = float(now_raw) if now_raw is not None else None
+                except ValueError:
+                    _send_error(
+                        self, 400, "event_timestamp_error", "unsortable event timestamp"
+                    )
+                    return
+                try:
+                    with lock:
+                        states = service.query_suppression_states(
+                            rule_id=params.get("rule_id", [None])[0],
+                            source=params.get("source", [None])[0],
+                            now_ms=now_ms,
+                        )
+                except EventTimestampError as exc:
+                    _send_error(self, 400, "event_timestamp_error", str(exc))
+                else:
+                    _send_json(self, 200, {"suppression_states": states})
+            elif self.path == "/v1/alerts":
                 with lock:
                     _send_json(self, 200, service.query_alerts())
             elif self.path == "/v1/series":

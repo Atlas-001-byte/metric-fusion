@@ -493,7 +493,348 @@ def _process_with_explanations(
     }
 
 
-def process(request: dict, *, registry: ExplanationRegistry | None = None) -> dict:
+# ---------------------------------------------------------------------------
+# Time-window suppression rules (per source and label dimensions)
+# ---------------------------------------------------------------------------
+
+WINDOW_STATUS_MISSED = "missed"  # 未命中
+WINDOW_STATUS_PENDING = "pending"  # 观察中
+WINDOW_STATUS_SUPPRESSED = "suppressed"  # 抑制中
+WINDOW_STATUS_RECOVERED = "recovered"  # 已恢复
+
+WINDOW_STATUSES = (
+    WINDOW_STATUS_MISSED,
+    WINDOW_STATUS_PENDING,
+    WINDOW_STATUS_SUPPRESSED,
+    WINDOW_STATUS_RECOVERED,
+)
+
+
+class RuleConfigurationError(ValueError):
+    """A time-window suppression rule (or an event handed to the rule engine
+    without a timestamp) is invalid."""
+
+
+class EventTimestampError(ValueError):
+    """An event timestamp cannot be ordered on the event-time axis."""
+
+
+def _validate_window_rule(raw: Any, seen_rule_ids: set) -> dict:
+    if not isinstance(raw, dict):
+        raise RuleConfigurationError("invalid window suppression rule")
+    rule_id = raw.get("rule_id")
+    if not (isinstance(rule_id, str) and rule_id != ""):
+        raise RuleConfigurationError("invalid rule_id")
+    if rule_id in seen_rule_ids:
+        raise RuleConfigurationError("duplicate rule_id")
+    source = raw.get("source")
+    if not (isinstance(source, str) and source != ""):
+        raise RuleConfigurationError("invalid source")
+    metric = raw.get("metric")
+    if not (isinstance(metric, str) and metric != ""):
+        raise RuleConfigurationError("invalid metric")
+    labels = raw.get("labels", {})
+    if labels is None:
+        labels = {}
+    if not isinstance(labels, dict):
+        raise RuleConfigurationError("invalid labels")
+    for key, value in labels.items():
+        if not (isinstance(key, str) and key != "" and isinstance(value, str)):
+            raise RuleConfigurationError("invalid labels")
+    pending_ms = raw.get("pending_ms")
+    if not (_is_int(pending_ms) and pending_ms >= 0):
+        raise RuleConfigurationError("invalid pending_ms")
+    suppression_ms = raw.get("suppression_ms")
+    if not (_is_int(suppression_ms) and suppression_ms >= 0):
+        raise RuleConfigurationError("invalid suppression_ms")
+    recovery_ms = raw.get("recovery_ms")
+    if not (_is_int(recovery_ms) and recovery_ms >= 0):
+        raise RuleConfigurationError("invalid recovery_ms")
+    seen_rule_ids.add(rule_id)
+    return {
+        "rule_id": rule_id,
+        "source": source,
+        "metric": metric,
+        "labels": dict(labels),
+        "pending_ms": pending_ms,
+        "suppression_ms": suppression_ms,
+        "recovery_ms": recovery_ms,
+    }
+
+
+def _validate_window_rules(raw: Any) -> list:
+    """Validate a list of time-window suppression rules (all or nothing)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise RuleConfigurationError("invalid window suppression rules")
+    seen_rule_ids: set = set()
+    return [_validate_window_rule(rule, seen_rule_ids) for rule in raw]
+
+
+class _WindowComboState:
+    """Suppression episode of one (rule_id, source, labels) combination."""
+
+    __slots__ = (
+        "labels",
+        "active_start",
+        "run_start",
+        "suppression_start",
+        "suppression_end",
+        "recovery_deadline",
+    )
+
+    def __init__(self, labels: dict) -> None:
+        self.labels = dict(labels)
+        self.active_start = None
+        self.run_start = None
+        self.suppression_start = None
+        self.suppression_end = None
+        self.recovery_deadline = None
+
+
+class WindowSuppressionEngine:
+    """Event-time state machine for time-window suppression rules.
+
+    One episode is tracked per ``(rule_id, source, canonical labels)``; label
+    combinations never influence each other. Matching events accumulate over
+    ``pending_ms`` before the episode turns ``suppressed``; the suppression
+    window never extends on repeated matches. Once ``suppression_ms`` has
+    elapsed the episode is in recovery observation: a match restarts the
+    observation (the recorded suppression end stays untouched), and only a
+    full quiet ``recovery_ms`` returns the combination to ``missed``.
+    """
+
+    def __init__(self, rules: list | None = None) -> None:
+        self._rules: list = []
+        self._states: dict = {}
+        self._last_event_time = None
+        if rules is not None:
+            self.set_rules(rules)
+
+    @property
+    def rules(self) -> list:
+        return [dict(rule, labels=dict(rule["labels"])) for rule in self._rules]
+
+    def set_rules(self, rules: list | None) -> None:
+        """Replace the rule set; takes effect for the next incoming event.
+
+        Already recorded episodes are kept untouched: changed durations never
+        retroactively alter recorded hits, and states of removed rules stay
+        queryable by rule_id — removal only stops future matching.
+        """
+        validated = _validate_window_rules(rules)
+        self._rules = validated
+
+    def reset(self) -> None:
+        """Drop all recorded episodes; the configured rules are kept."""
+        self._states = {}
+        self._last_event_time = None
+
+    # -- event intake ---------------------------------------------------------
+
+    def record_event(self, event: dict) -> None:
+        """Feed one observation (metric sample or alert) into the engine."""
+        if not isinstance(event, dict) or event.get("timestamp_ms") is None:
+            raise RuleConfigurationError("missing event timestamp")
+        timestamp_ms = event["timestamp_ms"]
+        if not _valid_timestamp(timestamp_ms):
+            raise EventTimestampError("unsortable event timestamp")
+        if self._last_event_time is None or timestamp_ms > self._last_event_time:
+            self._last_event_time = timestamp_ms
+        source = event.get("source")
+        name = event.get("name")
+        labels = event.get("labels")
+        if not (
+            isinstance(source, str)
+            and source != ""
+            and isinstance(name, str)
+            and isinstance(labels, dict)
+        ):
+            return
+        labels_key = _canonical_labels(labels)
+        for rule in self._matching_rules(source, name, labels):
+            key = (rule["rule_id"], source, labels_key)
+            state = self._states.get(key)
+            if state is None:
+                state = _WindowComboState(labels)
+                self._states[key] = state
+            self._advance(state, timestamp_ms, rule)
+
+    def _matching_rules(self, source: str, name: str, labels: dict):
+        for rule in self._rules:
+            if rule["source"] != source:
+                continue
+            if not _metric_matches(rule["metric"], name):
+                continue
+            if any(labels.get(key) != value for key, value in rule["labels"].items()):
+                continue
+            yield rule
+
+    def _advance(self, state: _WindowComboState, timestamp_ms: Any, rule: dict) -> None:
+        if state.suppression_end is not None:
+            if timestamp_ms <= state.suppression_end:
+                # Inside the suppression window: repeated matches never
+                # extend it.
+                return
+            if timestamp_ms <= state.recovery_deadline:
+                # A match during recovery restarts the observation; the
+                # recorded suppression end stays unchanged.
+                state.recovery_deadline = timestamp_ms + rule["recovery_ms"]
+                return
+            # Recovery completed quietly: the episode is over and this event
+            # starts a fresh observation run.
+            state.suppression_start = None
+            state.suppression_end = None
+            state.recovery_deadline = None
+            state.run_start = None
+        if state.run_start is None:
+            state.run_start = timestamp_ms
+            state.active_start = timestamp_ms
+        if timestamp_ms - state.run_start >= rule["pending_ms"]:
+            state.suppression_start = timestamp_ms
+            state.suppression_end = timestamp_ms + rule["suppression_ms"]
+            state.recovery_deadline = state.suppression_end + rule["recovery_ms"]
+
+    # -- suppression decisions --------------------------------------------------
+
+    def is_suppressed(self, source: str, name: str, labels: dict, timestamp_ms: Any) -> bool:
+        """Whether an alert emitted at ``timestamp_ms`` is suppressed.
+
+        When several rules hit the same event, the aggregate follows the
+        suppression window with the earliest end.
+        """
+        if not (
+            isinstance(source, str)
+            and isinstance(name, str)
+            and isinstance(labels, dict)
+            and _valid_timestamp(timestamp_ms)
+        ):
+            return False
+        labels_key = _canonical_labels(labels)
+        earliest_end = None
+        for rule in self._matching_rules(source, name, labels):
+            state = self._states.get((rule["rule_id"], source, labels_key))
+            if state is None or state.suppression_end is None:
+                continue
+            if not (state.suppression_start <= timestamp_ms <= state.recovery_deadline):
+                continue
+            if earliest_end is None or state.suppression_end < earliest_end:
+                earliest_end = state.suppression_end
+        return earliest_end is not None and timestamp_ms <= earliest_end
+
+    # -- queries ----------------------------------------------------------------
+
+    def query(
+        self,
+        rule_id: str | None = None,
+        source: str | None = None,
+        labels: dict | None = None,
+        now_ms: Any = None,
+    ) -> list:
+        """Return recorded suppression states, sorted by rule_id/source/labels.
+
+        ``now_ms`` defaults to the latest event time seen by the engine, so
+        adjudication stays on the event-time axis.
+        """
+        if now_ms is None:
+            now = self._last_event_time if self._last_event_time is not None else 0
+        elif _valid_timestamp(now_ms):
+            now = now_ms
+        else:
+            raise EventTimestampError("unsortable event timestamp")
+        records = []
+        for (state_rule_id, state_source, _labels_key), state in self._states.items():
+            if rule_id is not None and state_rule_id != rule_id:
+                continue
+            if source is not None and state_source != source:
+                continue
+            if labels is not None and any(
+                state.labels.get(key) != value for key, value in labels.items()
+            ):
+                continue
+            records.append(
+                {
+                    "rule_id": state_rule_id,
+                    "source": state_source,
+                    "labels": dict(state.labels),
+                    "active_start_ms": state.active_start,
+                    "suppression_end_ms": state.suppression_end,
+                    "status": self._status_of(state, now),
+                }
+            )
+        records.sort(
+            key=lambda record: (
+                record["rule_id"],
+                record["source"],
+                _canonical_labels(record["labels"]),
+            )
+        )
+        return records
+
+    @staticmethod
+    def _status_of(state: _WindowComboState, now: Any) -> str:
+        if state.suppression_end is not None:
+            if now <= state.suppression_end:
+                return WINDOW_STATUS_SUPPRESSED
+            if now <= state.recovery_deadline:
+                return WINDOW_STATUS_RECOVERED
+            return WINDOW_STATUS_MISSED
+        if state.run_start is not None:
+            return WINDOW_STATUS_PENDING
+        return WINDOW_STATUS_MISSED
+
+
+_default_window_engine = WindowSuppressionEngine()
+
+
+def query_window_suppressions(
+    rule_id: str | None = None,
+    source: str | None = None,
+    labels: dict | None = None,
+    now_ms: Any = None,
+    engine: WindowSuppressionEngine | None = None,
+) -> list:
+    """Query recorded time-window suppression states (see ``WindowSuppressionEngine.query``)."""
+    target = _default_window_engine if engine is None else engine
+    return target.query(rule_id=rule_id, source=source, labels=labels, now_ms=now_ms)
+
+
+def reset_window_suppressions() -> None:
+    """Clear the process-wide window-suppression episodes (mainly for tests)."""
+    _default_window_engine.reset()
+
+
+def _feed_window_events(engine: WindowSuppressionEngine, metrics: list, alerts: list) -> set:
+    """Drive the engine with one batch of events in event-time order.
+
+    Returns the ids of alerts suppressed by a window rule. An alert is
+    evaluated against the state right before its own event is recorded, so
+    the observation that triggers a suppression is still emitted and only
+    later observations are suppressed.
+    """
+    events = [(metric["timestamp_ms"], index, metric, None) for index, metric in enumerate(metrics)]
+    events += [
+        (alert["timestamp_ms"], len(metrics) + index, alert, alert["alert_id"])
+        for index, alert in enumerate(alerts)
+    ]
+    events.sort(key=lambda event: (event[0], event[1]))
+    suppressed_ids: set = set()
+    for timestamp_ms, _index, event, alert_id in events:
+        if alert_id is not None and engine.is_suppressed(
+            event["source"], event["name"], event["labels"], timestamp_ms
+        ):
+            suppressed_ids.add(alert_id)
+        engine.record_event(event)
+    return suppressed_ids
+
+
+def process(
+    request: dict,
+    *,
+    registry: ExplanationRegistry | None = None,
+    window_engine: WindowSuppressionEngine | None = None,
+) -> dict:
     """Fuse metrics and alerts from a request mapping into a response mapping."""
     if not isinstance(request, dict):
         raise ValueError("invalid request")
@@ -525,6 +866,14 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
         seen_rule_ids: set = set()
         rules = [_validate_suppression_rule(raw, seen_rule_ids) for raw in raw_rules]
 
+    # Time-window suppression rules stay dormant unless the request carries
+    # them; they are validated (all or nothing) up front and only become
+    # effective once the whole request has passed validation.
+    raw_window_rules = request.get("window_suppression_rules")
+    validated_window_rules: list | None = None
+    if raw_window_rules is not None:
+        validated_window_rules = _validate_window_rules(raw_window_rules)
+
     raw_metrics = request.get("metrics")
     raw_alerts = request.get("alerts")
     if not isinstance(raw_metrics, list) or not isinstance(raw_alerts, list):
@@ -535,17 +884,45 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
     alerts = [_validate_alert(alert, seen_ids) for alert in raw_alerts]
 
     series = _downsample(metrics, downsample_ms, aggregations)
+
+    window_suppressed_ids: set = set()
+    engine: WindowSuppressionEngine | None = None
+    if validated_window_rules is not None:
+        engine = _default_window_engine if window_engine is None else window_engine
+        engine.set_rules(validated_window_rules)
+        window_suppressed_ids = _feed_window_events(engine, metrics, alerts)
+
     result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, suppression_ms)
+    if window_suppressed_ids:
+        for entry in result_alerts:
+            if entry["alert_id"] in window_suppressed_ids:
+                entry["suppressed"] = True
+        suppressed_alert_ids = [entry["alert_id"] for entry in result_alerts if entry["suppressed"]]
 
     if not enabled:
-        return {
+        result = {
             "series": series,
             "alerts": result_alerts,
             "suppressed_alert_ids": suppressed_alert_ids,
         }
+        if engine is not None:
+            result["suppression_states"] = engine.query()
+        return result
 
     target_registry = _default_registry if registry is None else registry
-    return _process_with_explanations(alerts, series, rules, target_registry)
+    result = _process_with_explanations(alerts, series, rules, target_registry)
+    if engine is not None:
+        for output_alert in result["alerts"]:
+            if output_alert["alert_id"] in window_suppressed_ids:
+                output_alert["status"] = "suppressed"
+        merged_ids = set(result["suppressed_alert_ids"]) | window_suppressed_ids
+        result["suppressed_alert_ids"] = [
+            output_alert["alert_id"]
+            for output_alert in result["alerts"]
+            if output_alert["alert_id"] in merged_ids
+        ]
+        result["suppression_states"] = engine.query()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +994,7 @@ class MetricBatchService:
         suppression_rules: list | None = None,
         enable_explanations: bool = False,
         registry: ExplanationRegistry | None = None,
+        window_suppression_rules: list | None = None,
     ) -> None:
         if downsample_ms is not None and (not _is_int(downsample_ms) or downsample_ms <= 0):
             raise ValueError("invalid downsample_ms")
@@ -637,6 +1015,9 @@ class MetricBatchService:
         self._enable_explanations = enable_explanations
         self._rules = rules
         self._registry = ExplanationRegistry() if registry is None else registry
+        self._window_engine = WindowSuppressionEngine()
+        if window_suppression_rules is not None:
+            self._window_engine.set_rules(window_suppression_rules)
         self.reset()
 
     def reset(self) -> None:
@@ -651,6 +1032,9 @@ class MetricBatchService:
         self._alerts: list = []
         self._alert_ids: set = set()
         self._registry.clear()
+        # Recorded window-suppression episodes are state, the configured rules
+        # are not: reset clears the former and keeps the latter.
+        self._window_engine.reset()
 
     # -- validation ---------------------------------------------------------
 
@@ -687,6 +1071,14 @@ class MetricBatchService:
         max_event_time_ms = request.get("max_event_time_ms")
         if not _valid_timestamp(max_event_time_ms):
             raise BatchError(400, "metric_batch_invalid", "invalid max_event_time_ms")
+
+        # Optional window-suppression reconfiguration: validated up front and
+        # applied only once the whole batch has been accepted, taking effect
+        # before this batch's events are recorded.
+        raw_window_rules = request.get("window_suppression_rules")
+        validated_window_rules: list | None = None
+        if raw_window_rules is not None:
+            validated_window_rules = _validate_window_rules(raw_window_rules)
 
         raw_metrics = request.get("metrics")
         if not isinstance(raw_metrics, list):
@@ -779,6 +1171,15 @@ class MetricBatchService:
         self._retracted.discard(batch_id)
         self._alerts.extend(alerts)
         self._alert_ids.update(alert["alert_id"] for alert in alerts)
+
+        if validated_window_rules is not None:
+            self._window_engine.set_rules(validated_window_rules)
+        if self._window_engine.rules:
+            # Window-suppression episodes follow the event stream as observed;
+            # retraction does not rewrite this history.
+            _feed_window_events(
+                self._window_engine, list(batch_points.values()), alerts
+            )
 
         return {
             "batch_id": batch_id,
@@ -961,6 +1362,30 @@ class MetricBatchService:
         rows.sort(key=lambda row: (row["name"], _canonical_labels(row["labels"]), row["timestamp_ms"]))
         return rows
 
+    # -- window suppression rules --------------------------------------------
+
+    def set_window_suppression_rules(self, rules: list | None) -> None:
+        """Replace the time-window suppression rule set (all or nothing).
+
+        The new configuration governs events arriving after this call;
+        changing durations never retroactively alters recorded hits, and
+        removing a rule only stops future matching — its recorded states stay
+        queryable by rule_id.
+        """
+        self._window_engine.set_rules(rules)
+
+    def query_suppression_states(
+        self,
+        rule_id: str | None = None,
+        source: str | None = None,
+        labels: dict | None = None,
+        now_ms: Any = None,
+    ) -> list:
+        """Return recorded window-suppression states (see ``WindowSuppressionEngine.query``)."""
+        return self._window_engine.query(
+            rule_id=rule_id, source=source, labels=labels, now_ms=now_ms
+        )
+
     def query_alerts(self) -> dict:
         """Re-adjudicate all stored alerts against the current configuration.
 
@@ -968,9 +1393,34 @@ class MetricBatchService:
         the stored alert set are reflected in subsequent results.
         """
         alerts = list(self._alerts)
+        window_suppressed_ids = {
+            alert["alert_id"]
+            for alert in alerts
+            if self._window_engine.is_suppressed(
+                alert["source"], alert["name"], alert["labels"], alert["timestamp_ms"]
+            )
+        }
         if self._enable_explanations:
-            return _process_with_explanations(
+            result = _process_with_explanations(
                 alerts, self.query_series(), self._rules, self._registry
             )
+            if window_suppressed_ids:
+                for output_alert in result["alerts"]:
+                    if output_alert["alert_id"] in window_suppressed_ids:
+                        output_alert["status"] = "suppressed"
+                merged_ids = set(result["suppressed_alert_ids"]) | window_suppressed_ids
+                result["suppressed_alert_ids"] = [
+                    output_alert["alert_id"]
+                    for output_alert in result["alerts"]
+                    if output_alert["alert_id"] in merged_ids
+                ]
+            return result
         result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, self._suppression_ms)
+        if window_suppressed_ids:
+            for entry in result_alerts:
+                if entry["alert_id"] in window_suppressed_ids:
+                    entry["suppressed"] = True
+            suppressed_alert_ids = [
+                entry["alert_id"] for entry in result_alerts if entry["suppressed"]
+            ]
         return {"alerts": result_alerts, "suppressed_alert_ids": suppressed_alert_ids}
