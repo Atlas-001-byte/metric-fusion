@@ -108,6 +108,22 @@ service.query_alerts()   # 对当前已存告警重新裁决抑制，修正后�
 
 批次可附带 `alerts`（沿用既有告警校验），服务累积存储并在每次 `query_alerts()` 时重新裁决，因此修正后不再满足抑制条件的结果会反映在后续查询中。`service.reset()` 清空全部状态。
 
+批次撤回（补丁与迟到修正的逆操作）：
+
+```python
+service.retract_batch({"batch_id": "batch-001"})
+# => {"batch_id": "batch-001", "status": "retracted",
+#     "removed_metrics": 1, "removed_alerts": 0,
+#     "affected_streams": 1, "recomputed_windows": 1}
+```
+
+- `retract_batch` 按该批次去重后的规范数据点与规范告警移除贡献：`removed_metrics`、`removed_alerts` 分别为批次内去重后的指标数与告警数。
+- 同一数据点撤回后按剩余批次的批次秩 `(max_event_time_ms, batch_id)` 重新确定胜者：若更高秩批次仍覆盖该点则保留其值，否则由剩余最高秩批次接管，无剩余贡献时该点删除；同窗口其他样本也按既有批次秩语义稳定重算。
+- `affected_streams` 为聚合值变化或被清空的 `name + 规范 labels` 流数；`recomputed_windows` 为聚合值变化（含清空）的窗口数。值未变化的窗口与流不计入。
+- 撤回后 `query_series()`、`query_alerts()` 返回修正后的当前状态；告警重裁继续沿用 `suppression_ms`、级别突破、排序与 `suppressed_alert_ids`。
+- 幂等：同一 `batch_id` 重复应用只撤回一次；再次撤回仍返回 `status=retracted`，四个数量均为 0，状态不变。
+- `batch_id` 缺失、非字符串或空字符串、请求结构无法识别时整批拒绝，HTTP 400，`code` 固定为 `metric_batch_retract_invalid`；`batch_id` 从未应用时 HTTP 404，`code` 固定为 `metric_batch_not_found`。任何撤回失败均原子拒绝，不会部分删除数据或改动批次状态。
+
 HTTP 服务（仅内存状态）：
 
 ```bash
@@ -115,6 +131,7 @@ python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-m
 ```
 
 - `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；错误响应为 `{"code": ..., "message": ...}`，状态码如上。
+- `POST /v1/metric_batches/{batch_id}/retract`：撤回批次；`batch_id` 取自路径（非空字符串），请求体可空或为 JSON 对象。错误码为 `metric_batch_retract_invalid`（400）与 `metric_batch_not_found`（404）。
 - `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。
 
 ## 约定

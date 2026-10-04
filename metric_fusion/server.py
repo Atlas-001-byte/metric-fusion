@@ -10,6 +10,7 @@ import argparse
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
 
 from .core import BatchError, MetricBatchService, process
 
@@ -48,9 +49,49 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             else:
                 _send_json(self, 200, result)
 
+        def _handle_retract(self, batch_id: str) -> None:
+            try:
+                try:
+                    body = self._read_json()
+                except BatchError:
+                    # Unparseable payload is an unrecognized structure here.
+                    raise BatchError(
+                        400, "metric_batch_retract_invalid", "invalid request"
+                    )
+                if body is None:
+                    body = {}
+                if not isinstance(body, dict):
+                    raise BatchError(
+                        400, "metric_batch_retract_invalid", "invalid request"
+                    )
+                payload = dict(body)
+                payload["batch_id"] = batch_id
+                with lock:
+                    result = service.retract_batch(payload)
+            except BatchError as exc:
+                _send_error(self, exc.status, exc.code, str(exc))
+            else:
+                _send_json(self, 200, result)
+
+        def _retract_batch_id(self, path: str) -> str | None:
+            prefix = "/v1/metric_batches/"
+            suffix = "/retract"
+            if not (path.startswith(prefix) and path.endswith(suffix)):
+                return None
+            middle = path[len(prefix):-len(suffix)]
+            if "/" in middle:
+                return None
+            # An empty segment still matches the retract route; the service
+            # rejects the empty batch_id with the fixed validation code.
+            return unquote(middle)
+
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            path = urlparse(self.path).path
+            retract_id = self._retract_batch_id(path)
             if self.path == "/v1/metric_batches":
                 self._handle_batch()
+            elif retract_id is not None:
+                self._handle_retract(retract_id)
             elif self.path == "/process":
                 try:
                     result = process(self._read_json())
