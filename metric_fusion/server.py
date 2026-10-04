@@ -10,12 +10,15 @@ import argparse
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-from .core import BatchError, MetricBatchService, process
+from .core import BatchError, MetricBatchService, RuleConfigurationError, process
 
 RETRACT_PREFIX = "/v1/metric_batches/"
 RETRACT_SUFFIX = "/retract"
+WINDOW_RULES_PATH = "/v1/window_rules"
+WINDOW_RULES_PREFIX = "/v1/window_rules/"
+WINDOW_STATES_PATH = "/v1/window_states"
 
 
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -90,10 +93,26 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             else:
                 _send_json(self, 200, result)
 
+        def _handle_window_rules(self) -> None:
+            try:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    raise RuleConfigurationError("invalid request")
+                with lock:
+                    result = service.configure_window_rules(body.get("rules"))
+            except BatchError as exc:
+                _send_error(self, exc.status, exc.code, str(exc))
+            except RuleConfigurationError as exc:
+                _send_error(self, 400, "window_rule_invalid", str(exc))
+            else:
+                _send_json(self, 200, result)
+
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
             path = urlsplit(self.path).path
             if path == "/v1/metric_batches":
                 self._handle_batch()
+            elif path == WINDOW_RULES_PATH:
+                self._handle_window_rules()
             elif path.startswith(RETRACT_PREFIX):
                 batch_id = self._retract_batch_id(path)
                 if batch_id is None:
@@ -143,6 +162,38 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             elif self.path == "/v1/series":
                 with lock:
                     _send_json(self, 200, {"series": service.query_series()})
+            elif urlsplit(self.path).path == WINDOW_STATES_PATH:
+                params = parse_qs(urlsplit(self.path).query)
+                rule_id = params.get("rule_id", [None])[0]
+                source = params.get("source", [None])[0]
+                now_raw = params.get("now_ms", [None])[0]
+                try:
+                    now_ms = None if now_raw is None else json.loads(now_raw)
+                    with lock:
+                        states = service.query_window_states(
+                            rule_id=rule_id, source=source, now_ms=now_ms
+                        )
+                except ValueError as exc:
+                    _send_error(self, 400, "invalid_request", str(exc))
+                else:
+                    _send_json(self, 200, {"states": states})
+            else:
+                _send_error(self, 404, "not_found", "not found")
+
+        def do_DELETE(self) -> None:  # noqa: N802 - stdlib handler API
+            path = urlsplit(self.path).path
+            if path.startswith(WINDOW_RULES_PREFIX):
+                rule_id = unquote(path[len(WINDOW_RULES_PREFIX):])
+                if rule_id == "" or "/" in rule_id:
+                    _send_error(self, 400, "window_rule_invalid", "invalid rule_id")
+                    return
+                try:
+                    with lock:
+                        result = service.delete_window_rule(rule_id)
+                except RuleConfigurationError as exc:
+                    _send_error(self, 400, "window_rule_invalid", str(exc))
+                else:
+                    _send_json(self, 200, result)
             else:
                 _send_error(self, 404, "not_found", "not found")
 

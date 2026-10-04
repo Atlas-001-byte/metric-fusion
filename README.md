@@ -132,6 +132,48 @@ service.query_alerts()   # 对当前已存告警重新裁决抑制，修正后�
 
 批次可附带 `alerts`（沿用既有告警校验），服务累积存储并在每次 `query_alerts()` 时重新裁决，因此修正后不再满足抑制条件的结果会反映在后续查询中。`service.reset()` 清空全部状态。
 
+## 时间窗抑制规则（按来源与标签维度，有状态服务）
+
+`MetricBatchService` 支持按来源与标签维度生效的时间窗抑制规则。样本与归并结果仍沿既有处理路径流动；规则命中时不删除原始观测，而是把原本应发出的告警标记为 `suppressed`，并留下可查询的抑制状态。无状态 `process` 入口不读取该配置。
+
+规则通过构造函数 `window_rules=`、`service.configure_window_rules(rules)` 或 `POST /v1/window_rules`（请求体 `{"rules": [...]}`）输入：
+
+```json
+{
+  "rule_id": "cpu-flap",
+  "timestamp_ms": 1000,
+  "source": "agent-a",
+  "metric": "cpu.*",
+  "labels": {"host": "db-1"},
+  "for_ms": 10000,
+  "suppression_ms": 20000,
+  "recovery_ms": 5000
+}
+```
+
+- `timestamp_ms` 为规则生效时间，只有事件时间不早于它的事件才参与匹配；`source`/`metric` 支持精确串、`*` 与含 `*` 的通配；`labels` 为标签等值条件，需全部命中。`for_ms`（持续时长）、`suppression_ms`（抑制时长）、`recovery_ms`（恢复时长）均为非负整数毫秒。
+- 配置在下一次事件进入前生效；以相同 `rule_id` 重复提交为幂等更新，修改 `for_ms`/`suppression_ms`/`recovery_ms` 不追溯已经记录的命中。`service.delete_window_rule(rule_id)`（或 `DELETE /v1/window_rules/{rule_id}`）仅停止后续匹配，历史抑制状态仍可按 `rule_id` 查询。
+- 校验失败统一抛 `RuleConfigurationError`（`ValueError` 子类）：时间戳缺失或非法、持续/抑制/恢复时长为负或缺失、来源为空、指标名匹配条件为空、标签匹配条件非法、`rule_id` 为空或重复。单次提交整体校验，失败不部分生效；HTTP 返回 400，`code` 固定为 `window_rule_invalid`。
+
+事件与状态机：
+
+- 每个应用批次中的去重样本按事件时间驱动状态机（也可用 `service.record_event(event)` 直接提交单个事件）；事件时间戳无法排序（非数值、非有限或为负）时抛 `EventTimestampError`。
+- 状态按 `(rule_id, source, 规范 labels)` 组合独立维护，不同标签组合互不影响：`inactive`（未命中）→ `observing`（观察中）→ `suppressed`（抑制中）→ `recovered`（已恢复）→ `inactive`。
+- 连续匹配自首次命中起累计，事件时间达到 `for_ms` 立即进入 `suppressed`，抑制窗口为 `[命中时间, 命中时间 + suppression_ms]`，不再因重复样本延长；窗口结束后进入恢复观察，`recovery_ms` 内没有再次命中才回到 `inactive`，期间再次命中则重新开始观察且原抑制结束时间不变。
+- 重复提交同一事件（同 `source/name/labels/timestamp_ms`）与同一规则不产生重复窗口或相互矛盾的状态；批次撤回不回溯已记录的抑制历史，`service.reset()` 清空抑制状态但保留规则配置。
+- 告警裁决：原本应发出的告警，若其 `(source, name, labels)` 落在某条规则已记录的抑制窗口内，则标记为 `suppressed` 并计入 `suppressed_alert_ids`；同一事件同时命中多条规则时各规则结果按 `rule_id` 升序保留，汇总状态以最早结束的抑制窗口为准（结束时间相同取 `rule_id` 升序）。没有匹配规则的数据继续按原有顺序和结果返回，既有异常语义不变。
+
+查询（过滤均可省略；`now_ms` 缺省时取已处理事件的最大事件时间）：
+
+```python
+service.query_window_states(rule_id="cpu-flap", source="agent-a",
+                            labels={"host": "db-1"}, now_ms=90000)
+```
+
+返回按 `(rule_id, source, 规范 labels)` 升序的记录，每条含 `rule_id`、`source`、`labels`、`active_since`（活跃开始时间）、`suppression_end`（抑制结束时间，从未抑制为 `None`）与 `status`（`inactive`/`observing`/`suppressed`/`recovered`）。HTTP 对应 `GET /v1/window_states?rule_id=&source=&now_ms=`，返回 `{"states": [...]}`。
+
+另有公开类型 `WindowSuppressionEngine`（`configure_rules`/`delete_rule`/`record_event`/`query`/`is_suppressed`/`clear`）可独立使用。
+
 HTTP 服务（仅内存状态）：
 
 ```bash

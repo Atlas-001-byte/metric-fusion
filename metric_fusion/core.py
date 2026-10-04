@@ -549,6 +549,325 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
 
 
 # ---------------------------------------------------------------------------
+# Time-window suppression rules (scoped by source and labels)
+# ---------------------------------------------------------------------------
+
+
+class RuleConfigurationError(ValueError):
+    """Invalid time-window suppression rule configuration."""
+
+
+class EventTimestampError(ValueError):
+    """An event timestamp cannot be ordered on the event-time axis."""
+
+
+def _validate_window_rule(raw: Any, seen_rule_ids: set) -> dict:
+    """Validate one time-window suppression rule.
+
+    Every failure raises ``RuleConfigurationError``; nothing is applied
+    partially by the caller because validation finishes before any rule
+    is stored.
+    """
+    if not isinstance(raw, dict):
+        raise RuleConfigurationError("invalid window rule")
+    rule_id = raw.get("rule_id")
+    if not (isinstance(rule_id, str) and rule_id != ""):
+        raise RuleConfigurationError("invalid rule_id")
+    if rule_id in seen_rule_ids:
+        raise RuleConfigurationError("duplicate rule_id")
+    timestamp_ms = raw.get("timestamp_ms")
+    if not _valid_timestamp(timestamp_ms):
+        raise RuleConfigurationError("invalid rule timestamp")
+    source = raw.get("source")
+    if not (isinstance(source, str) and source != ""):
+        raise RuleConfigurationError("invalid source")
+    metric = raw.get("metric")
+    if not (isinstance(metric, str) and metric != ""):
+        raise RuleConfigurationError("invalid metric")
+    labels = raw.get("labels", {})
+    if labels is None:
+        labels = {}
+    if not isinstance(labels, dict) or any(
+        not (isinstance(key, str) and key != "" and isinstance(value, str))
+        for key, value in labels.items()
+    ):
+        raise RuleConfigurationError("invalid labels")
+    for_ms = raw.get("for_ms")
+    if not (_is_int(for_ms) and for_ms >= 0):
+        raise RuleConfigurationError("invalid for_ms")
+    suppression_ms = raw.get("suppression_ms")
+    if not (_is_int(suppression_ms) and suppression_ms >= 0):
+        raise RuleConfigurationError("invalid suppression_ms")
+    recovery_ms = raw.get("recovery_ms")
+    if not (_is_int(recovery_ms) and recovery_ms >= 0):
+        raise RuleConfigurationError("invalid recovery_ms")
+    seen_rule_ids.add(rule_id)
+    return {
+        "rule_id": rule_id,
+        "timestamp_ms": timestamp_ms,
+        "source": source,
+        "metric": metric,
+        "labels": dict(labels),
+        "for_ms": for_ms,
+        "suppression_ms": suppression_ms,
+        "recovery_ms": recovery_ms,
+    }
+
+
+class WindowSuppressionEngine:
+    """Event-time state machine for time-window suppression rules.
+
+    One independent state is kept per ``(rule_id, source, canonical
+    labels)`` combination, so different label combinations never affect
+    each other::
+
+        inactive -> observing -> suppressed -> recovered -> inactive
+
+    Matches accumulate from the first hit of an observation; once the span
+    reaches ``for_ms`` the combination enters ``suppressed`` immediately
+    with a fixed window ``[hit, hit + suppression_ms]`` that repeated
+    samples never extend. When the window ends the combination is
+    ``recovered`` (recovery observation); only if no match recurs within
+    ``recovery_ms`` does it return to ``inactive`` — a match inside the
+    recovery window restarts observation while the recorded suppression
+    end time stays unchanged.
+
+    A rule applies only to events whose event time is not earlier than the
+    rule's own ``timestamp_ms``, so reconfiguring durations never rewrites
+    already recorded hits. Re-submitting the same event (same
+    source/name/labels/timestamp_ms) under the same rule is a no-op.
+    """
+
+    STATUSES = ("inactive", "observing", "suppressed", "recovered")
+
+    def __init__(self) -> None:
+        self._rules: dict = {}  # rule_id -> validated rule
+        self._states: dict = {}  # (rule_id, source, labels_key) -> record
+        self._max_event_ts: Any = None
+
+    # -- configuration ----------------------------------------------------
+
+    def configure_rules(self, rules: list) -> int:
+        """Upsert rules atomically; returns how many rules were configured.
+
+        Every rule is validated before any of them is stored, so a
+        ``RuleConfigurationError`` leaves the current configuration
+        untouched. A rule whose ``rule_id`` already exists is replaced
+        (recorded hits keep their original windows).
+        """
+        if not isinstance(rules, list):
+            raise RuleConfigurationError("invalid window rules")
+        seen_rule_ids: set = set()
+        validated = [_validate_window_rule(raw, seen_rule_ids) for raw in rules]
+        for rule in validated:
+            self._rules[rule["rule_id"]] = rule
+        return len(validated)
+
+    def delete_rule(self, rule_id: Any) -> bool:
+        """Stop future matching for one rule; its recorded states stay."""
+        if not (isinstance(rule_id, str) and rule_id != ""):
+            raise RuleConfigurationError("invalid rule_id")
+        return self._rules.pop(rule_id, None) is not None
+
+    # -- events -----------------------------------------------------------
+
+    def record_event(self, event: Any) -> list:
+        """Feed one event (source/name/labels/timestamp_ms) into the machine.
+
+        Returns the resulting per-rule state views for every rule the event
+        hit, ordered by ascending rule_id. An event whose timestamp cannot
+        be ordered (non-numeric, non-finite or negative) raises
+        ``EventTimestampError``.
+        """
+        if not isinstance(event, dict):
+            raise EventTimestampError("invalid event timestamp")
+        timestamp_ms = event.get("timestamp_ms")
+        if not _valid_timestamp(timestamp_ms):
+            raise EventTimestampError("invalid event timestamp")
+        source = event.get("source")
+        source = source if isinstance(source, str) else ""
+        name = event.get("name")
+        name = name if isinstance(name, str) else ""
+        labels = event.get("labels")
+        labels = labels if isinstance(labels, dict) else {}
+
+        if self._max_event_ts is None or timestamp_ms > self._max_event_ts:
+            self._max_event_ts = timestamp_ms
+
+        hits = []
+        for rule_id in sorted(self._rules):
+            rule = self._rules[rule_id]
+            if timestamp_ms < rule["timestamp_ms"]:
+                continue
+            if not _metric_matches(rule["source"], source):
+                continue
+            if not _metric_matches(rule["metric"], name):
+                continue
+            if any(labels.get(key) != value for key, value in rule["labels"].items()):
+                continue
+            hits.append(self._apply_match(rule, source, labels, name, timestamp_ms))
+        return hits
+
+    def _apply_match(self, rule: dict, source: str, labels: dict, name: str, timestamp_ms: Any) -> dict:
+        labels_key = _canonical_labels(labels)
+        key = (rule["rule_id"], source, labels_key)
+        record = self._states.get(key)
+        if record is None:
+            record = {
+                "rule": rule,
+                "rule_id": rule["rule_id"],
+                "source": source,
+                "labels": dict(labels),
+                "labels_key": labels_key,
+                "phase": "inactive",
+                "observation_start": None,
+                "suppression_start": None,
+                "suppression_end": None,
+                "recovery_end": None,
+                "seen": set(),
+            }
+            self._states[key] = record
+        # The current configuration governs future transitions; windows
+        # already recorded above are never recomputed retroactively.
+        record["rule"] = rule
+
+        event_id = (name, timestamp_ms)
+        if event_id in record["seen"]:
+            # Duplicate event under the same rule: no new window, no change.
+            return self._view(record, timestamp_ms)
+        record["seen"].add(event_id)
+
+        phase = record["phase"]
+        # Time-driven advancement to the event's time.
+        if phase == "suppressed" and timestamp_ms >= record["suppression_end"]:
+            phase = "recovered"
+        if phase == "recovered" and timestamp_ms >= record["recovery_end"]:
+            phase = "inactive"
+            record["observation_start"] = None
+        if phase == "inactive":
+            record["observation_start"] = timestamp_ms
+            phase = "observing"
+        if phase == "observing":
+            if timestamp_ms - record["observation_start"] >= rule["for_ms"]:
+                self._start_suppression(record, rule, timestamp_ms)
+                phase = "suppressed"
+        elif phase == "recovered":
+            # A match inside the recovery window restarts observation; the
+            # recorded suppression window stays untouched.
+            record["observation_start"] = timestamp_ms
+            phase = "observing"
+            if timestamp_ms - record["observation_start"] >= rule["for_ms"]:
+                self._start_suppression(record, rule, timestamp_ms)
+                phase = "suppressed"
+        # "suppressed": repeated matches never extend the window.
+        record["phase"] = phase
+        return self._view(record, timestamp_ms)
+
+    @staticmethod
+    def _start_suppression(record: dict, rule: dict, timestamp_ms: Any) -> None:
+        record["suppression_start"] = timestamp_ms
+        record["suppression_end"] = timestamp_ms + rule["suppression_ms"]
+        record["recovery_end"] = (
+            timestamp_ms + rule["suppression_ms"] + rule["recovery_ms"]
+        )
+
+    # -- queries ----------------------------------------------------------
+
+    def _view(self, record: dict, reference_ms: Any) -> dict:
+        """The externally observable state of one record at a reference time."""
+        phase = record["phase"]
+        if phase == "suppressed" and reference_ms >= record["suppression_end"]:
+            phase = "recovered"
+        if phase == "recovered" and reference_ms >= record["recovery_end"]:
+            phase = "inactive"
+        if phase == "observing":
+            active_since = record["observation_start"]
+        elif phase in ("suppressed", "recovered"):
+            active_since = record["suppression_start"]
+        else:
+            active_since = None
+        return {
+            "rule_id": record["rule_id"],
+            "source": record["source"],
+            "labels": dict(record["labels"]),
+            "active_since": active_since,
+            "suppression_end": record["suppression_end"],
+            "status": phase,
+        }
+
+    def query(
+        self,
+        rule_id: str | None = None,
+        source: str | None = None,
+        labels: dict | None = None,
+        now_ms: Any = None,
+    ) -> list:
+        """Return state views, optionally filtered by rule/source/label subset.
+
+        ``now_ms`` is the reference time used to resolve time-driven
+        statuses; it defaults to the greatest event time processed so far.
+        Results are ordered by (rule_id, source, canonical labels).
+        """
+        if now_ms is None:
+            reference = self._max_event_ts if self._max_event_ts is not None else 0
+        else:
+            if not _valid_timestamp(now_ms):
+                raise ValueError("invalid now_ms")
+            reference = now_ms
+        if labels is not None and not isinstance(labels, dict):
+            raise ValueError("invalid labels")
+
+        views = []
+        for (rec_rule_id, rec_source, _labels_key), record in self._states.items():
+            if rule_id is not None and rec_rule_id != rule_id:
+                continue
+            if source is not None and rec_source != source:
+                continue
+            if labels is not None and any(
+                record["labels"].get(key) != value for key, value in labels.items()
+            ):
+                continue
+            views.append(self._view(record, reference))
+        views.sort(
+            key=lambda view: (
+                view["rule_id"],
+                view["source"],
+                _canonical_labels(view["labels"]),
+            )
+        )
+        return views
+
+    def is_suppressed(self, source: str, name: str, labels: dict, timestamp_ms: Any) -> bool:
+        """Aggregate window decision for one alertable point.
+
+        Among the rules matching ``(source, name, labels)`` that have a
+        recorded suppression window, the earliest-ending window governs
+        (ties break by ascending rule_id).
+        """
+        labels_key = _canonical_labels(labels)
+        best = None
+        for (rule_id, rec_source, rec_labels_key), record in self._states.items():
+            if rec_source != source or rec_labels_key != labels_key:
+                continue
+            if record["suppression_end"] is None:
+                continue
+            if not _metric_matches(record["rule"]["metric"], name):
+                continue
+            rank = (record["suppression_end"], rule_id)
+            if best is None or rank < best[0]:
+                best = (rank, record)
+        if best is None:
+            return False
+        record = best[1]
+        return record["suppression_start"] <= timestamp_ms < record["suppression_end"]
+
+    def clear(self) -> None:
+        """Drop all recorded states; configured rules survive."""
+        self._states.clear()
+        self._max_event_ts = None
+
+
+# ---------------------------------------------------------------------------
 # Metric batch patches and late-data correction
 # ---------------------------------------------------------------------------
 
@@ -617,6 +936,7 @@ class MetricBatchService:
         suppression_rules: list | None = None,
         enable_explanations: bool = False,
         registry: ExplanationRegistry | None = None,
+        window_rules: list | None = None,
     ) -> None:
         if downsample_ms is not None and (not _is_int(downsample_ms) or downsample_ms <= 0):
             raise ValueError("invalid downsample_ms")
@@ -637,6 +957,9 @@ class MetricBatchService:
         self._enable_explanations = enable_explanations
         self._rules = rules
         self._registry = ExplanationRegistry() if registry is None else registry
+        self._window_engine = WindowSuppressionEngine()
+        if window_rules is not None:
+            self._window_engine.configure_rules(window_rules)
         self.reset()
 
     def reset(self) -> None:
@@ -651,6 +974,9 @@ class MetricBatchService:
         self._alerts: list = []
         self._alert_ids: set = set()
         self._registry.clear()
+        # Window-rule configuration survives a reset; only recorded
+        # suppression states are cleared.
+        self._window_engine.clear()
 
     # -- validation ---------------------------------------------------------
 
@@ -779,6 +1105,12 @@ class MetricBatchService:
         self._retracted.discard(batch_id)
         self._alerts.extend(alerts)
         self._alert_ids.update(alert["alert_id"] for alert in alerts)
+
+        # Samples also flow through the time-window suppression machine as
+        # event-time events; original observations are never deleted, and a
+        # duplicate batch above never reaches this point.
+        for metric in batch_points.values():
+            self._window_engine.record_event(metric)
 
         return {
             "batch_id": batch_id,
@@ -965,12 +1297,81 @@ class MetricBatchService:
         """Re-adjudicate all stored alerts against the current configuration.
 
         Suppression is recomputed on every query, so corrections that change
-        the stored alert set are reflected in subsequent results.
+        the stored alert set are reflected in subsequent results. Alerts the
+        baseline adjudication would emit are additionally marked suppressed
+        when their (source, name, labels) fall inside a recorded time-window
+        suppression window; alerts no rule matches keep their original
+        results and order.
         """
         alerts = list(self._alerts)
         if self._enable_explanations:
-            return _process_with_explanations(
+            result = _process_with_explanations(
                 alerts, self.query_series(), self._rules, self._registry
             )
-        result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, self._suppression_ms)
+            for output_alert in result["alerts"]:
+                if output_alert["status"] == "active" and self._window_engine.is_suppressed(
+                    output_alert["source"],
+                    output_alert["name"],
+                    output_alert["labels"],
+                    output_alert["timestamp_ms"],
+                ):
+                    output_alert["status"] = "suppressed"
+            result["suppressed_alert_ids"] = [
+                output_alert["alert_id"]
+                for output_alert in result["alerts"]
+                if output_alert["status"] == "suppressed"
+            ]
+            return result
+        result_alerts, _baseline_ids = _suppress_alerts(alerts, self._suppression_ms)
+        suppressed_alert_ids = []
+        for stored, output_alert in zip(alerts, result_alerts):
+            if not output_alert["suppressed"] and self._window_engine.is_suppressed(
+                stored["source"], stored["name"], stored["labels"], stored["timestamp_ms"]
+            ):
+                output_alert["suppressed"] = True
+            if output_alert["suppressed"]:
+                suppressed_alert_ids.append(output_alert["alert_id"])
         return {"alerts": result_alerts, "suppressed_alert_ids": suppressed_alert_ids}
+
+    # -- time-window suppression rules --------------------------------------
+
+    def configure_window_rules(self, rules: list) -> dict:
+        """Upsert time-window suppression rules; effective for the next event.
+
+        Re-submitting a rule with the same ``rule_id`` replaces it; changed
+        durations never recompute already recorded hits. Validation is
+        atomic — a ``RuleConfigurationError`` leaves the current
+        configuration untouched.
+        """
+        configured = self._window_engine.configure_rules(rules)
+        return {"configured": configured}
+
+    def delete_window_rule(self, rule_id: Any) -> dict:
+        """Stop future matching for one rule; its history stays queryable."""
+        self._window_engine.delete_rule(rule_id)
+        return {"rule_id": rule_id, "status": "deleted"}
+
+    def record_event(self, event: dict) -> list:
+        """Submit one suppression event outside the batch flow.
+
+        Returns the per-rule state views the event hit, ordered by ascending
+        rule_id. An unorderable timestamp raises ``EventTimestampError``.
+        """
+        return self._window_engine.record_event(event)
+
+    def query_window_states(
+        self,
+        rule_id: str | None = None,
+        source: str | None = None,
+        labels: dict | None = None,
+        now_ms: Any = None,
+    ) -> list:
+        """Return current window-suppression states (all filters optional).
+
+        Each record carries ``rule_id``, ``source``, ``labels``,
+        ``active_since``, ``suppression_end`` and ``status`` (one of
+        ``inactive``/``observing``/``suppressed``/``recovered``).
+        """
+        return self._window_engine.query(
+            rule_id=rule_id, source=source, labels=labels, now_ms=now_ms
+        )
