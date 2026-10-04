@@ -120,6 +120,27 @@ def _validate_aggregations(raw: Any) -> dict:
     return validated
 
 
+def _validate_source_quorum(raw: Any) -> dict:
+    """Validate a ``source_quorum`` mapping of exact metric name to threshold.
+
+    Returns ``{}`` for an absent/None mapping (every window is emitted).
+    Anything that is not a mapping of non-empty string keys to positive
+    integers raises ``ValueError("invalid source_quorum")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid source_quorum")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid source_quorum")
+        if not (_is_int(value) and value > 0):
+            raise ValueError("invalid source_quorum")
+        validated[key] = value
+    return validated
+
+
 def _new_bucket() -> dict:
     return {"sum": 0.0, "count": 0, "sources": set(), "min": None, "max": None, "last": None}
 
@@ -153,7 +174,12 @@ def _bucket_value(bucket: dict, func: str) -> float:
     return round(value + 0.0, 6)  # normalize -0.0
 
 
-def _downsample(metrics: list, downsample_ms: int, aggregations: dict | None = None) -> list:
+def _downsample(
+    metrics: list,
+    downsample_ms: int,
+    aggregations: dict | None = None,
+    source_quorum: dict | None = None,
+) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
     points: dict = {}
@@ -180,6 +206,12 @@ def _downsample(metrics: list, downsample_ms: int, aggregations: dict | None = N
     series = []
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
         bucket = buckets[(name, labels_key, start)]
+        # Source quorum: a window is emitted only when its deduplicated
+        # source set reaches the threshold configured for the metric.
+        if source_quorum:
+            quorum = source_quorum.get(name)
+            if quorum is not None and len(bucket["sources"]) < quorum:
+                continue
         func = aggregations.get(name, "avg") if aggregations else "avg"
         series.append(
             {
@@ -850,6 +882,9 @@ def process(
     # so a failure leaves nothing partially applied.
     aggregations = _validate_aggregations(request.get("aggregations"))
 
+    # Per-metric source quorum; validated up front for the same reason.
+    source_quorum = _validate_source_quorum(request.get("source_quorum"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -883,7 +918,7 @@ def process(
     seen_ids: set = set()
     alerts = [_validate_alert(alert, seen_ids) for alert in raw_alerts]
 
-    series = _downsample(metrics, downsample_ms, aggregations)
+    series = _downsample(metrics, downsample_ms, aggregations, source_quorum)
 
     window_suppressed_ids: set = set()
     engine: WindowSuppressionEngine | None = None
@@ -1318,14 +1353,18 @@ class MetricBatchService:
         start_ms: Any = None,
         end_ms: Any = None,
         aggregations: dict | None = None,
+        source_quorum: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
         Optional filters: exact metric name, label subset match, and a
         ``[start_ms, end_ms]`` range over window start times. ``aggregations``
         maps exact metric names to ``avg``/``min``/``max``/``sum``/``last``;
-        unmapped metrics keep the default ``avg``. Output rows keep the
-        existing fields and the existing (name, labels, timestamp) order.
+        unmapped metrics keep the default ``avg``. ``source_quorum`` maps
+        exact metric names to a positive source-count threshold; a window is
+        emitted only when its deduplicated source set reaches the threshold.
+        Output rows keep the existing fields and the existing
+        (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
             raise ValueError("invalid name")
@@ -1335,6 +1374,7 @@ class MetricBatchService:
             if bound is not None and not _valid_timestamp(bound):
                 raise ValueError("invalid time range")
         agg_map = _validate_aggregations(aggregations)
+        quorum_map = _validate_source_quorum(source_quorum)
 
         rows = []
         for (bucket_name, labels_key, start), bucket in self._buckets.items():
@@ -1348,6 +1388,9 @@ class MetricBatchService:
             if start_ms is not None and start < start_ms:
                 continue
             if end_ms is not None and start > end_ms:
+                continue
+            quorum = quorum_map.get(bucket_name)
+            if quorum is not None and len(bucket["sources"]) < quorum:
                 continue
             rows.append(
                 {
