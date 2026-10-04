@@ -23,6 +23,7 @@ result = process(request)  # request/result 均为 UTF-8 JSON 对应的 dict
 
 ```bash
 python -m metric_fusion request.json > result.json
+python -m metric_fusion --serve [--host 127.0.0.1] [--port 8080]  # 见下文 HTTP 适配
 ```
 
 成功退出码为 0；失败时把异常信息写入标准错误并以退出码 2 结束。
@@ -69,6 +70,47 @@ query_explanations(fingerprint="...", now_ms=60000)  # 指定当前时间
 - 不存在的指纹或 `rule_id` 返回 `[]`，不抛异常。
 - 另有 `ExplanationRegistry`（可传给 `process(..., registry=)` 以隔离状态）与 `reset_explanations()`。
 - 开启模式下的新增校验错误：`invalid suppression rules`、`invalid suppression rule`、`invalid rule_id`、`duplicate rule_id`、`invalid selector`、`invalid enable_explanations`。任何校验失败均抛 `ValueError` 且本次处理不产生任何输出或解释记录。
+
+## 指标批次补丁与迟到数据修正
+
+在上述无状态 `process` 入口之外，新增有状态的批次入口（内存态，不额外落盘、不新增持久化入口）：
+
+```python
+from metric_fusion import MetricStore, apply_metric_batch, query_series, query_batch_alerts
+
+store = MetricStore(downsample_ms=1000, suppression_ms=5000)
+receipt = store.apply_batch({
+    "batch_id": "batch-0001",
+    "max_event_time_ms": 10000,
+    "metrics": [{"source": "s1", "name": "cpu.usage", "labels": {"host": "a"},
+                 "timestamp_ms": 100, "value": 3.0}],
+    "alerts": [],
+})
+store.query_series(name="cpu.usage", start_ms=0, end_ms=60000)
+store.query_alerts()
+```
+
+- 批次样本沿用既有指标身份（source/name/labels）、归并键、降采样窗口（`timestamp_ms // downsample_ms * downsample_ms`）、跨 source 取均值与告警抑制语义；同身份点仍以后覆盖先。
+- 已识别批次（含非空字符串 `batch_id`）必须带 `max_event_time_ms`（有限非负数，毫秒）。窗口网格取构造参数 `downsample_ms`；未配置时批次可自带 `downsample_ms`，网格一经确定不得更改（不同值报 `invalid downsample_ms`）。
+- **幂等**：同一 `batch_id` 重复到达只生效一次。重复批次与首次内容（样本、告警、水位，顺序无关）完全一致时返回 `status="already_applied"`、两个数量均为 0，视为成功；内容不同则整批拒绝，抛 `BatchError(code="metric_batch_conflict")`，对应 HTTP 409。
+- **区间校验**：样本时间戳晚于 `max_event_time_ms` 时整批拒绝，`code="metric_batch_range_invalid"`，HTTP 400（时间戳按地板网格必不早于窗口起点）。
+- **归属窗口不可静默丢弃**：有样本但无法确定网格（未配置且批次未携带）时整批拒绝，`code="metric_window_unresolved"`，HTTP 422；仅告警批次不受此限。
+- 三类批次错误都是 `BatchError`（`ValueError` 子类），`.http_status` 给出状态码；形状/类型错误仍为普通 `ValueError`（如 `invalid batch_id`、`invalid max_event_time_ms`）。任何拒绝都是原子的，不产生部分写入。
+- **迟到修正**：补丁只重算样本落入的窗口（回执 `recomputed_windows` 即去重窗口数，`affected_streams` 为受影响指标流数），随后在合并后的全量数据上重新裁决告警；曾被抑制的告警可能变为发出，开启解释模式时过时解释记录同步撤销。之后 `query_series` / `query_alerts` 返回修正结果，与批次到达顺序无关，同一输入集合结果确定。
+- 查询：`query_series(name=None, labels=None, start_ms=None, end_ms=None)`（标签为等值包含条件，时间按窗口起点、闭区间）按 name、规范 labels、窗口起点排序，输出字段与基线一致；`query_alerts()` 返回当前抑制裁决；开启解释的 store 另有 `query_explanations(...)`。`reset()` 清空全部内存状态。
+- 另有进程级默认 store 便捷函数：`apply_metric_batch`、`query_series`、`query_batch_alerts`、`reset_batches`。
+- 未提供 `batch_id` 时仍走原有批次方式：`max_event_time_ms` 可省，缺失网格按原规则报 `invalid downsample_ms`，不做幂等记录；旧版指标批次与原 `process` 入口的输入、输出、异常完全不变。
+
+### HTTP 适配
+
+`metric_fusion/server.py` 提供仅依赖标准库的薄适配层（单实例、内存态），`POST /batches` 提交批次，`GET /series`（参数 `name`、`labels=<JSON>`、`start_ms`、`end_ms`）与 `GET /alerts` 查询：
+
+```bash
+python -m metric_fusion --serve --host 127.0.0.1 --port 8080
+# 可选环境变量 METRIC_FUSION_DOWNSAMPLE_MS / METRIC_FUSION_SUPPRESSION_MS 预置网格
+```
+
+成功回执：`{"batch_id": ..., "status": "applied" | "already_applied", "affected_streams": N, "recomputed_windows": N}`；拒绝响应为 `{"code": "metric_batch_conflict" | "metric_batch_range_invalid" | "metric_window_unresolved"}`，状态码分别为 409/400/422。
 
 ## 约定
 
