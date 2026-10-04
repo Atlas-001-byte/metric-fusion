@@ -43,6 +43,16 @@ python -m metric_fusion request.json > result.json
 - 有状态服务在补丁、迟到修正与批次撤回后按当前胜者样本重算所选函数；批次秩、幂等、`affected_streams`、`recomputed_windows`、告警重裁与顺序无关语义不变。聚合只影响选定的 series 查询：`GET /v1/series`、`GET /v1/alerts` 与告警抑制不读取该配置。
 - 校验：`aggregations` 不是字符串到允许函数名的映射、键为空串或值不支持时，库调用抛 `ValueError("invalid aggregation")`；HTTP 返回 400，`{"code": "invalid_request", "message": "invalid aggregation"}`；CLI 输出该消息并以 2 退出。校验失败不部分修改状态。
 
+## 来源法定人数过滤（可选）
+
+`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `source_quorum` 映射：键为精确指标名，值为正整数阈值。去重、窗口归并与来源收集完成后，按 `name + 规范 labels + 窗口` 判断：只有窗口的**去重 sources 数量大于或等于阈值**时才输出该行。未达到阈值的窗口不进入 series，不做补点、部分输出或错误处理。未提供 `source_quorum`、或窗口指标名未命中映射时，维持现有默认聚合（`avg`）与全部窗口输出。
+
+- 阈值按窗口的完整去重来源集判断（与 `sources` 字段同一集合），不能按样本数（`count`）或请求条数判断；`source/name/labels/timestamp_ms` 去重先于覆盖度判断。
+- 可与 `aggregations` 同时使用：达到阈值的窗口仍按所选函数输出 `round(value, 6)`、`-0.0` 归一、`count`、`sources` 与既有排序；未达到阈值的窗口即使配置了聚合函数也不输出。
+- 有状态服务在补丁、迟到修正或批次撤回后重新查询时，按当前胜者样本重算来源覆盖，只输出仍满足阈值的窗口；批次秩、幂等与撤回结果不受影响。
+- 查询范围、`name` 与 `labels` 过滤及排序继续沿用当前口径。`GET /v1/series`、`GET /v1/alerts` 与告警抑制（含抑制解释、时间窗规则）不读取 `source_quorum`；批次应用/撤回请求也不接受该配置，其行为与响应字段不变。
+- 校验：`source_quorum` 必须是字符串到正整数的映射，键非空，值不能为布尔值、零、负数或浮点数；非法时库调用抛 `ValueError("invalid source_quorum")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_quorum"}`，CLI 输出 `invalid source_quorum` 并以 2 退出。校验失败不改变已有状态。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。
