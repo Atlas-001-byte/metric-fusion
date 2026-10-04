@@ -98,6 +98,21 @@ result = service.apply_batch({
 - 跨批次同一数据点（`source/name/labels/timestamp_ms`）冲突按批次秩 `(max_event_time_ms, batch_id)` 确定胜者，与到达顺序无关；因此批次到达顺序不影响最终聚合值，同一输入集合重复执行结果相同。
 - 其他校验失败（结构、字段、重复 `alert_id` 等）返回 HTTP 400，`code` 为 `metric_batch_invalid`，`message` 沿用既有校验消息。所有失败均为整批拒绝，不产生部分效果。
 
+### 批次撤回
+
+`service.retract_batch(batch_id)`（及 `POST /v1/metric_batches/{batch_id}/retract`）撤回一个已应用批次，用于批次补丁与迟到修正。撤回按该批次**去重后的规范数据点和规范告警**移除贡献：
+
+- 同一 `batch_id` 重复应用后只撤回一次；撤回后再撤回同一 `batch_id` 仍返回 `status="retracted"`，但 `removed_metrics`、`removed_alerts`、`affected_streams`、`recomputed_windows` 均为 0，状态不再变化。
+- 同一数据点撤回后，按剩余批次的批次秩 `(max_event_time_ms, batch_id)` 重新确定胜者：若更高秩批次仍覆盖该点，其值保持不变；否则恢复剩余最高秩批次的值。同窗口其他样本也按既有批次秩语义稳定重算，到达顺序仍不影响结果。
+- 响应字段：
+  - `removed_metrics` / `removed_alerts`：该批次去重后的数据点数 / 告警数（幂等再次撤回时为 0）。
+  - `affected_streams`：聚合值发生变化或窗口被清空的 `name + 规范 labels` 流数量；仅撤回了落败批次、聚合值不变的流不计入。
+  - `recomputed_windows`：聚合值发生变化（含被清空）的降采样窗口数量。
+- 撤回后 `query_series`、`query_alerts` 以及 HTTP 全量/筛选查询都返回修正后的当前状态；告警仍按 `suppression_ms`、级别突破与排序重新裁决，`suppressed_alert_ids` 随之更新（例如撤回抑制者后，原被抑制告警恢复为 active）。
+- 典型补丁流程：撤回有问题的批次后，可以用同一 `batch_id` 重新提交修正内容，作为一次全新应用生效。
+- 错误：`batch_id` 不是非空字符串（含路径结构无法识别）返回 HTTP 400，`code` 固定为 `metric_batch_retract_invalid`；`batch_id` 从未应用返回 HTTP 404，`code` 固定为 `metric_batch_not_found`。任何撤回失败都原子拒绝，不会部分删除数据或改动批次状态。
+
+
 查询（结果始终反映当前状态，排序与窗口边界与既有输出一致）：
 
 ```python
@@ -114,7 +129,7 @@ HTTP 服务（仅内存状态）：
 python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-ms 30000
 ```
 
-- `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；错误响应为 `{"code": ..., "message": ...}`，状态码如上。
+- `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；`POST /v1/metric_batches/{batch_id}/retract`：撤回批次（请求体可空，若有则须为可识别 JSON）。错误响应为 `{"code": ..., "message": ...}`，状态码如上。
 - `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。
 
 ## 约定

@@ -496,6 +496,7 @@ def process(request: dict, *, registry: ExplanationRegistry | None = None) -> di
 # ---------------------------------------------------------------------------
 
 BATCH_APPLIED = "applied"
+BATCH_RETRACTED = "retracted"
 
 
 class BatchError(ValueError):
@@ -583,8 +584,11 @@ class MetricBatchService:
 
     def reset(self) -> None:
         """Drop all applied batches, samples, windows and alerts."""
-        self._batches: dict = {}  # batch_id -> content fingerprint
-        self._points: dict = {}  # point_key -> (rank, metric)
+        self._batches: dict = {}  # batch_id -> batch record
+        self._retracted: set = set()  # batch_ids in the terminal retracted state
+        # Each point keeps one candidate per contributing batch rank so that
+        # retracting the winning batch can restore the next-highest rank.
+        self._points: dict = {}  # point_key -> {rank: metric}
         self._bucket_points: dict = {}  # bucket_key -> set of point_key
         self._buckets: dict = {}  # bucket_key -> {sum, count, sources}
         self._alerts: list = []
@@ -661,7 +665,7 @@ class MetricBatchService:
         fingerprint = _batch_fingerprint(max_event_time_ms, metrics, alerts)
         known = self._batches.get(batch_id)
         if known is not None:
-            if known == fingerprint:
+            if known["fingerprint"] == fingerprint:
                 # Full duplicate: report success with nothing re-applied.
                 return {
                     "batch_id": batch_id,
@@ -670,6 +674,9 @@ class MetricBatchService:
                     "recomputed_windows": 0,
                 }
             raise BatchError(409, "metric_batch_conflict", "metric batch conflict")
+        # A retracted batch left no contributions behind, so re-applying the
+        # same batch_id is a fresh application (the typical patch flow: retract
+        # the faulty batch, then resubmit its correction under the same id).
 
         rank = (max_event_time_ms, batch_id)
         # Within one batch, identical points dedupe with the later one winning.
@@ -686,21 +693,33 @@ class MetricBatchService:
         affected_streams: set = set()
         affected_buckets: set = set()
         for point_key, metric in batch_points.items():
-            existing = self._points.get(point_key)
-            if existing is not None and existing[0] >= rank:
-                continue  # a newer-or-equal batch already owns this point
-            self._points[point_key] = (rank, metric)
+            candidates = self._points.setdefault(point_key, {})
+            if rank in candidates:
+                # Same rank tuple cannot occur for a different batch_id (the
+                # batch_id is part of the rank) and duplicate batches were
+                # handled above; nothing to merge in that case.
+                continue
+            winning_before = max(candidates) if candidates else None
+            candidates[rank] = metric
             labels_key = point_key[2]
             start = (point_key[3] // self._downsample_ms) * self._downsample_ms
             bucket_key = (point_key[1], labels_key, start)
             self._bucket_points.setdefault(bucket_key, set()).add(point_key)
-            affected_streams.add((point_key[1], labels_key))
-            affected_buckets.add(bucket_key)
+            if winning_before is None or rank > winning_before:
+                # Only a newly winning value changes the aggregate/stream.
+                affected_streams.add((point_key[1], labels_key))
+                affected_buckets.add(bucket_key)
 
         for bucket_key in affected_buckets:
             self._recompute_bucket(bucket_key)
 
-        self._batches[batch_id] = fingerprint
+        self._batches[batch_id] = {
+            "fingerprint": fingerprint,
+            "rank": rank,
+            "points": batch_points,
+            "alerts": alerts,
+        }
+        self._retracted.discard(batch_id)
         self._alerts.extend(alerts)
         self._alert_ids.update(alert["alert_id"] for alert in alerts)
 
@@ -711,14 +730,128 @@ class MetricBatchService:
             "recomputed_windows": len(affected_buckets),
         }
 
+    def _point_winner(self, point_key: tuple) -> tuple | None:
+        """Return ``(rank, metric)`` of the highest-rank candidate, if any."""
+        candidates = self._points.get(point_key)
+        if not candidates:
+            return None
+        rank = max(candidates)
+        return rank, candidates[rank]
+
     def _recompute_bucket(self, bucket_key: tuple) -> None:
         bucket = {"sum": 0.0, "count": 0, "sources": set()}
+        live_points = set()
         for point_key in self._bucket_points[bucket_key]:
-            _rank, metric = self._points[point_key]
+            winner = self._point_winner(point_key)
+            if winner is None:
+                continue
+            live_points.add(point_key)
+            _rank, metric = winner
             bucket["sum"] += metric["value"]
             bucket["count"] += 1
             bucket["sources"].add(metric["source"])
+        if bucket["count"] == 0:
+            # No winning samples remain: the window disappears from queries.
+            self._bucket_points.pop(bucket_key, None)
+            self._buckets.pop(bucket_key, None)
+            return
+        self._bucket_points[bucket_key] = live_points
         self._buckets[bucket_key] = bucket
+
+    # -- batch retraction ---------------------------------------------------
+
+    def retract_batch(self, batch_id: Any) -> dict:
+        """Retract a previously applied batch and correct the current state.
+
+        The batch's deduplicated points and alerts stop contributing. Points
+        shared with other batches re-resolve to the highest remaining batch
+        rank; affected windows recompute under the same rank semantics. A
+        second retraction of the same id is an idempotent no-op that still
+        reports ``retracted`` with zero counts.
+        """
+        if not (isinstance(batch_id, str) and batch_id != ""):
+            raise BatchError(
+                400, "metric_batch_retract_invalid", "invalid batch_id"
+            )
+        if batch_id in self._retracted:
+            return {
+                "batch_id": batch_id,
+                "status": BATCH_RETRACTED,
+                "removed_metrics": 0,
+                "removed_alerts": 0,
+                "affected_streams": 0,
+                "recomputed_windows": 0,
+            }
+        record = self._batches.get(batch_id)
+        if record is None:
+            raise BatchError(404, "metric_batch_not_found", "metric batch not found")
+
+        rank = record["rank"]
+        batch_points = record["points"]
+        alerts = record["alerts"]
+
+        # Identify every window the batch contributed candidates to and
+        # snapshot its aggregate. Everything below is in-memory bookkeeping
+        # that cannot fail, so retraction either commits fully or (on the
+        # validation failures above) never starts.
+        affected_buckets: set = set()
+        for point_key in batch_points:
+            labels_key = point_key[2]
+            start = (point_key[3] // self._downsample_ms) * self._downsample_ms
+            affected_buckets.add((point_key[1], labels_key, start))
+
+        before_windows = {
+            bucket_key: self._window_value(bucket_key) for bucket_key in affected_buckets
+        }
+
+        for point_key in batch_points:
+            candidates = self._points.get(point_key)
+            if candidates is None or rank not in candidates:
+                continue
+            del candidates[rank]
+            if not candidates:
+                self._points.pop(point_key, None)
+
+        for alert in alerts:
+            try:
+                self._alerts.remove(alert)
+            except ValueError:
+                pass
+            self._alert_ids.discard(alert["alert_id"])
+
+        # Re-resolve winners among the remaining batch ranks. A window whose
+        # higher-rank batch still covers a point keeps exactly its value; only
+        # windows whose aggregate value changed (or that are cleared) count.
+        changed_windows: set = set()
+        for bucket_key, before in before_windows.items():
+            self._recompute_bucket(bucket_key)
+            if self._window_value(bucket_key) != before:
+                changed_windows.add(bucket_key)
+
+        changed_streams = {(key[0], key[1]) for key in changed_windows}
+
+        self._batches.pop(batch_id, None)
+        self._retracted.add(batch_id)
+
+        return {
+            "batch_id": batch_id,
+            "status": BATCH_RETRACTED,
+            "removed_metrics": len(batch_points),
+            "removed_alerts": len(alerts),
+            "affected_streams": len(changed_streams),
+            "recomputed_windows": len(changed_windows),
+        }
+
+    def _window_value(self, bucket_key: tuple):
+        """The query-visible aggregate value of a window, or None if it is gone.
+
+        Only this value decides whether retraction changed observable output:
+        count/source differences behind an identical mean change nothing.
+        """
+        bucket = self._buckets.get(bucket_key)
+        if bucket is None:
+            return None
+        return round(bucket["sum"] / bucket["count"] + 0.0, 6)
 
     # -- queries --------------------------------------------------------------
 

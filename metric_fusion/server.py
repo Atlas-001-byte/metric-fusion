@@ -10,8 +10,12 @@ import argparse
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
 
 from .core import BatchError, MetricBatchService, process
+
+RETRACT_PREFIX = "/v1/metric_batches/"
+RETRACT_SUFFIX = "/retract"
 
 
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -48,9 +52,59 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             else:
                 _send_json(self, 200, result)
 
+        def _retract_batch_id(self, path: str) -> str | None:
+            """Extract a batch_id from the retract path, or None if malformed.
+
+            The accepted shape is exactly
+            ``/v1/metric_batches/{batch_id}/retract`` with a single non-empty
+            path segment as the id; percent-encoding is decoded.
+            """
+            if not (path.startswith(RETRACT_PREFIX) and path.endswith(RETRACT_SUFFIX)):
+                return None
+            middle = path[len(RETRACT_PREFIX):-len(RETRACT_SUFFIX)]
+            if middle == "" or "/" in middle:
+                return None
+            return unquote(middle)
+
+        def _handle_retract(self, batch_id: str) -> None:
+            # A request body is optional; if present it must be recognizable
+            # JSON rather than an opaque payload.
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if raw.strip():
+                try:
+                    json.loads(raw.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    _send_error(
+                        self,
+                        400,
+                        "metric_batch_retract_invalid",
+                        "invalid request",
+                    )
+                    return
+            try:
+                with lock:
+                    result = service.retract_batch(batch_id)
+            except BatchError as exc:
+                _send_error(self, exc.status, exc.code, str(exc))
+            else:
+                _send_json(self, 200, result)
+
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
-            if self.path == "/v1/metric_batches":
+            path = urlsplit(self.path).path
+            if path == "/v1/metric_batches":
                 self._handle_batch()
+            elif path.startswith(RETRACT_PREFIX):
+                batch_id = self._retract_batch_id(path)
+                if batch_id is None:
+                    _send_error(
+                        self,
+                        400,
+                        "metric_batch_retract_invalid",
+                        "invalid batch_id",
+                    )
+                else:
+                    self._handle_retract(batch_id)
             elif self.path == "/process":
                 try:
                     result = process(self._read_json())
