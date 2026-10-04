@@ -53,6 +53,25 @@ python -m metric_fusion request.json > result.json
 - 查询范围、`name` 与 `labels` 过滤及排序继续沿用当前口径。`GET /v1/series`、`GET /v1/alerts` 与告警抑制（含抑制解释、时间窗规则）不读取 `source_quorum`；批次应用/撤回请求也不接受该配置，其行为与响应字段不变。
 - 校验：`source_quorum` 必须是字符串到正整数的映射，键非空，值不能为布尔值、零、负数或浮点数；非法时库调用抛 `ValueError("invalid source_quorum")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_quorum"}`，CLI 输出 `invalid source_quorum` 并以 2 退出。校验失败不改变已有状态。
 
+## 按指标目标的源权重归并（可选）
+
+`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `source_weights` 映射：键为精确指标名（指标目标），值为该目标的来源权重配置——`{来源: 权重}` 映射，或 `[{"source": ..., "weight": ...}]` 条目列表。未提供 `source_weights`、或指标名未命中映射时，维持现有等权重（`avg` 或所选聚合函数）行为，输出字段与形状完全不变。
+
+```json
+"source_weights": {
+  "cpu.usage": {"agent-a": 2.0, "agent-b": 1.0},
+  "mem.usage": [{"source": "agent-a", "weight": 1.0}, {"source": "agent-b", "weight": 0.0}]
+}
+```
+
+- 去重（`source/name/labels/timestamp_ms` 后覆盖先）、窗口起点、迟到修正与批次秩语义不变；权重只在归并取值时生效。同一来源在同一窗口重复提交沿用当前去重与迟到处理语义。
+- 启用权重的目标，窗口返回值为所有有效参与值按配置权重求加权和后除以有效权重之和：每个去重样本以其来源权重 `w` 贡献 `value * w` 到分子、`w` 到分母。权重为零的来源只计入可用性（出现在 `sources` 与 `count` 中）但不改变数值；未列出的来源不参与——既不贡献值也不计入 `sources`/`count`。同一目标允许少于全部已知来源参与。
+- 权重目标的窗口行保留现有时间粒度、标签与序列标识及 `name/labels/timestamp_ms/value/count/sources` 字段，`value` 仍 `round(value, 6)` 且 `-0.0` 归一；权重目标不读取 `aggregations` 的函数选择，`source_quorum` 仍按完整去重来源集过滤窗口。
+- 若窗口内只有权重为零的来源、有效权重之和为零，或样本均不属于配置允许的来源，该窗口不产生数值结果：`value` 为 `null` 并附 `"weight_missing": true` 标记（正常窗口行不含该字段）。窗口内没有任何样本时继续沿用现有无数据语义（不产生窗口行）。
+- 有状态服务在补丁、迟到修正或批次撤回后重新查询时，按当前胜者样本重算加权结果；批次应用/撤回请求不携带该配置，批次秩、幂等、`affected_streams`、`recomputed_windows` 与告警重裁行为不变。`GET /v1/series`、`GET /v1/alerts` 与告警抑制不读取 `source_weights`。
+- 校验：`source_weights` 必须是字符串到权重配置的映射，键非空；每个目标至少配置一个来源，权重为大于等于零的有限数值（不能为布尔值、负数、非有限数），同一来源不得重复配置。非法时库调用抛 `ValueError("invalid source_weights")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_weights"}`，CLI 输出 `invalid source_weights` 并以 2 退出。校验为全有或全无，失败时不加载任何部分配置、不改变已有状态。
+- 样本校验沿用既有口径：缺少来源、指标目标或时间戳、数值为非有限数时抛出样本无效异常（库为 `ValueError("invalid metric")` / `ValueError("invalid value")`，批次 API 为 400 `metric_batch_invalid`）并拒绝该条样本；校验先于任何状态变更，已接受的其他样本与既有查询结果不受影响。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。

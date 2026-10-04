@@ -142,14 +142,75 @@ def _validate_source_quorum(raw: Any) -> dict:
     return validated
 
 
+def _validate_source_weights(raw: Any) -> dict:
+    """Validate a ``source_weights`` mapping of exact metric name to per-source weights.
+
+    Returns ``{}`` for an absent/None mapping (every metric merges with equal
+    weights, i.e. the existing plain aggregation). Each target maps to either
+    a ``{source: weight}`` mapping or a list of ``{"source", "weight"}``
+    entries; weights must be finite numbers >= 0, a target must list at least
+    one source, and no source may be configured twice for the same target.
+    Anything invalid raises ``ValueError("invalid source_weights")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid source_weights")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid source_weights")
+        validated[key] = _validate_weight_entries(value)
+    return validated
+
+
+def _validate_weight_entries(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        entries = [{"source": source, "weight": weight} for source, weight in raw.items()]
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        raise ValueError("invalid source_weights")
+    if not entries:
+        # A target configured with an empty source set is invalid.
+        raise ValueError("invalid source_weights")
+    weights: dict = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid source_weights")
+        source = entry.get("source")
+        if not (isinstance(source, str) and source != ""):
+            raise ValueError("invalid source_weights")
+        if source in weights:
+            raise ValueError("invalid source_weights")
+        weight = entry.get("weight")
+        if not (_is_number(weight) and math.isfinite(weight) and weight >= 0):
+            raise ValueError("invalid source_weights")
+        weights[source] = weight
+    return weights
+
+
 def _new_bucket() -> dict:
-    return {"sum": 0.0, "count": 0, "sources": set(), "min": None, "max": None, "last": None}
+    return {
+        "sum": 0.0,
+        "count": 0,
+        "sources": set(),
+        "min": None,
+        "max": None,
+        "last": None,
+        "per_source": {},
+    }
 
 
 def _bucket_add(bucket: dict, source: str, timestamp_ms: Any, value: Any) -> None:
     bucket["sum"] += value
     bucket["count"] += 1
     bucket["sources"].add(source)
+    per_source = bucket["per_source"].get(source)
+    if per_source is None:
+        per_source = bucket["per_source"][source] = [0.0, 0]
+    per_source[0] += value
+    per_source[1] += 1
     if bucket["min"] is None or value < bucket["min"]:
         bucket["min"] = value
     if bucket["max"] is None or value > bucket["max"]:
@@ -175,11 +236,55 @@ def _bucket_value(bucket: dict, func: str) -> float:
     return round(value + 0.0, 6)  # normalize -0.0
 
 
+def _weighted_bucket_value(bucket: dict, weights: dict):
+    """Weighted merge of a window's deduplicated samples, or None.
+
+    Only configured sources participate. A source with a positive weight
+    contributes each of its samples as ``value * weight`` to the numerator and
+    ``weight`` to the denominator; a zero-weight source counts towards
+    availability only and never changes the value. When no sample carries an
+    effective (positive) weight the window has no numeric result.
+    """
+    numerator = 0.0
+    denominator = 0.0
+    for source, (source_sum, source_count) in bucket["per_source"].items():
+        weight = weights.get(source)
+        if weight is None or weight <= 0:
+            continue
+        numerator += source_sum * weight
+        denominator += source_count * weight
+    if denominator == 0:
+        return None
+    return round(numerator / denominator + 0.0, 6)  # normalize -0.0
+
+
+def _weighted_row(name: str, labels_key: str, start: Any, bucket: dict, weights: dict) -> dict:
+    # Sources not listed in the target's weight configuration do not
+    # participate at all: they contribute neither value nor availability.
+    participating = [source for source in bucket["sources"] if source in weights]
+    value = _weighted_bucket_value(bucket, weights)
+    row = {
+        "name": name,
+        "labels": json.loads(labels_key),
+        "timestamp_ms": start,
+        "value": value,
+        "count": sum(bucket["per_source"][source][1] for source in participating),
+        "sources": sorted(participating),
+    }
+    if value is None:
+        # The window had samples but no effective weight: mark it instead of
+        # emitting a number. Windows without any sample keep the existing
+        # no-data semantics (no row at all).
+        row["weight_missing"] = True
+    return row
+
+
 def _downsample(
     metrics: list,
     downsample_ms: int,
     aggregations: dict | None = None,
     source_quorum: dict | None = None,
+    source_weights: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -211,6 +316,12 @@ def _downsample(
         # set of the window — never the sample or request count. Windows below
         # the threshold are dropped entirely: no fill points or partial rows.
         if source_quorum and name in source_quorum and len(bucket["sources"]) < source_quorum[name]:
+            continue
+        weights = source_weights.get(name) if source_weights else None
+        if weights is not None:
+            # Weight-enabled targets merge by configured source weights; the
+            # aggregation-function selection does not apply to them.
+            series.append(_weighted_row(name, labels_key, start, bucket, weights))
             continue
         func = aggregations.get(name, "avg") if aggregations else "avg"
         series.append(
@@ -976,6 +1087,11 @@ def process(
     # the same all-or-nothing reason as aggregations.
     source_quorum = _validate_source_quorum(request.get("source_quorum"))
 
+    # Optional per-target source weights; validated up front (all or nothing)
+    # so a rejected configuration leaves nothing partially applied. Targets
+    # absent from the mapping keep the default equal-weight merge.
+    source_weights = _validate_source_weights(request.get("source_weights"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1013,7 +1129,7 @@ def process(
     seen_ids: set = set()
     alerts = [_validate_alert(alert, seen_ids) for alert in raw_alerts]
 
-    series = _downsample(metrics, downsample_ms, aggregations, source_quorum)
+    series = _downsample(metrics, downsample_ms, aggregations, source_quorum, source_weights)
 
     window_suppressed_ids: set = set()
     engine: WindowSuppressionEngine | None = None
@@ -1457,6 +1573,7 @@ class MetricBatchService:
         end_ms: Any = None,
         aggregations: dict | None = None,
         source_quorum: dict | None = None,
+        source_weights: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -1465,8 +1582,13 @@ class MetricBatchService:
         maps exact metric names to ``avg``/``min``/``max``/``sum``/``last``;
         unmapped metrics keep the default ``avg``. ``source_quorum`` maps exact
         metric names to positive integers: a window is output only when its
-        deduplicated source set reaches the threshold. Output rows keep the
-        existing fields and the existing (name, labels, timestamp) order.
+        deduplicated source set reaches the threshold. ``source_weights`` maps
+        exact metric names to per-source weight configurations: a listed
+        target merges each window as the weighted sum of its participating
+        samples divided by the effective weight sum, and windows without
+        effective weight are marked ``weight_missing`` with a null value.
+        Output rows keep the existing fields and the existing
+        (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
             raise ValueError("invalid name")
@@ -1477,6 +1599,7 @@ class MetricBatchService:
                 raise ValueError("invalid time range")
         agg_map = _validate_aggregations(aggregations)
         quorum_map = _validate_source_quorum(source_quorum)
+        weights_map = _validate_source_weights(source_weights)
 
         rows = []
         for (bucket_name, labels_key, start), bucket in self._buckets.items():
@@ -1498,6 +1621,10 @@ class MetricBatchService:
                 bucket_name in quorum_map
                 and len(bucket["sources"]) < quorum_map[bucket_name]
             ):
+                continue
+            weights = weights_map.get(bucket_name)
+            if weights is not None:
+                rows.append(_weighted_row(bucket_name, labels_key, start, bucket, weights))
                 continue
             rows.append(
                 {
