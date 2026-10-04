@@ -131,6 +131,42 @@ query_window_suppressions(rule_id="cpu-flap", now_ms=60000)
 - 错误：时间戳缺失、持续时长为负、抑制时长或恢复时长为负、来源为空、指标名匹配条件为空、标签匹配条件非法（含 `rule_id` 为空或重复）统一抛 `RuleConfigurationError`；处理事件遇到无法排序的时间戳（非数值、非有限或为负）抛 `EventTimestampError`。两者均为 `ValueError` 子类；校验失败为整批拒绝，不产生部分效果。HTTP 下分别返回 400，`code` 为 `rule_configuration_error` / `event_timestamp_error`。
 - HTTP：`PUT`/`POST /v1/window_suppression_rules`（请求体为规则列表或 `{"rules": [...]}`，整体替换配置）；`GET /v1/window_suppressions?rule_id=&source=&now_ms=` 返回 `{"suppression_states": [...]}`。
 
+## 计划维护窗口告警抑制（可选）
+
+在请求中加入 `maintenance_windows`（窗口数组）即启用；缺省不提供时，所有输出与基线完全一致，不读取也不校验该字段。维护窗口是纯时间判定：**只看告警的 `timestamp_ms`**，不消费指标样本，也不参与 series、聚合、来源法定人数与查询过滤。
+
+窗口形如：
+
+```json
+{
+  "window_id": "deploy-db-1",
+  "start_ms": 100000,
+  "end_ms": 200000,
+  "source": "agent-a",
+  "name": "cpu.usage",
+  "labels": {"host": "db-1"}
+}
+```
+
+- `window_id` 为非空字符串且同批内不重复；`start_ms`/`end_ms` 为非负有限数值（整数或浮点，布尔值拒绝），且 `end_ms > start_ms`。区间左闭右开：`start_ms <= timestamp_ms < end_ms`，恰在 `end_ms` 的告警不被抑制。
+- 匹配条件为精确匹配：`source`、`name` 提供时为非空字符串；`labels` 是键非空的映射，按标签子集精确等值命中（值可为任意 JSON 值，按类型严格相等）。三者都可省略，但至少提供一个。
+- 命中窗口的告警标记为抑制，与既有 `suppression_ms` 时间抑制（含更高级别突破）及时间窗规则抑制**取并集**：`suppressed_alert_ids` 不重复且保持告警原顺序；非解释模式下告警输出字段仍为 `alert_id/severity/suppressed`。
+- 解释模式（`enable_explanations`）下沿用现有抑制状态表达：被维护窗口命中的告警 `status` 为 `suppressed"`，其余字段、顺序与 `explanations` 记录不变（维护窗口自身不产生解释记录）。
+- 无状态 `process` 请求可直接携带 `maintenance_windows`，仅对当次裁决生效。
+
+有状态服务：
+
+```python
+service = MetricBatchService(maintenance_windows=[...])
+service.set_maintenance_windows([...])   # 全量替换；校验整批通过后才生效
+service.reset()                          # 清空数据，但保留维护窗口配置
+```
+
+- 批次迟到修正或撤回后再次查询时，按当前告警集对当前配置重新判定。
+- 批次应用请求不读取该配置字段；series、聚合、来源法定人数、`POST /v1/query` 过滤均不读取维护窗口。
+- HTTP：`PUT` 或 `POST /v1/maintenance_windows` 更新配置，请求体为窗口数组或 `{"maintenance_windows": [...]}`，整批校验通过后一次替换，成功返回 `{"status": "ok"}`。
+- 校验：`window_id` 为空/非字符串/重复，时间戳非数值、非有限、为负或 `end_ms <= start_ms`，三个条件全部缺失，`source`/`name` 非法或 `labels` 不是键非空的映射时，库调用与无状态处理抛 `ValueError("invalid maintenance_window")`（公开异常类型 `MaintenanceWindowError`，为 `ValueError` 子类）；CLI 输出该消息并以 2 退出；HTTP 返回 400，`{"code": "invalid_maintenance_window", "message": "invalid maintenance_window"}`。任何失败均整批拒绝，已有配置保持不变、无部分效果。
+
 ## 指标批次补丁与迟到修正（有状态服务）
 
 `MetricBatchService` 在内存中维护指标流状态，接受带批次标识的指标样本批次，支持幂等应用与迟到数据修正；不增加任何落盘文件或持久化入口。
@@ -191,6 +227,7 @@ python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-m
 ```
 
 - `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；`POST /v1/metric_batches/{batch_id}/retract`：撤回批次（请求体可空，若有则须为可识别 JSON）。错误响应为 `{"code": ..., "message": ...}`，状态码如上。
+- `PUT`/`POST /v1/maintenance_windows`：整体替换维护窗口配置（请求体为数组或 `{"maintenance_windows": [...]}`）；非法时 400，`code` 固定为 `invalid_maintenance_window`，已有配置不变。
 - `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。
 
 ## 约定

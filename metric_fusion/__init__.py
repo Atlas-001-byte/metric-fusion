@@ -4,6 +4,7 @@ from .core import (
     BatchError,
     EventTimestampError,
     ExplanationRegistry,
+    MaintenanceWindowError,
     MetricBatchService,
     RuleConfigurationError,
     WindowSuppressionEngine,
@@ -26,6 +27,7 @@ __all__ = [
     "WindowSuppressionEngine",
     "RuleConfigurationError",
     "EventTimestampError",
+    "MaintenanceWindowError",
     "query_window_suppressions",
     "reset_window_suppressions",
 ]

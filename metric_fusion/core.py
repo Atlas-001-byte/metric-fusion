@@ -861,6 +861,104 @@ def _feed_window_events(engine: WindowSuppressionEngine, metrics: list, alerts: 
     return suppressed_ids
 
 
+# ---------------------------------------------------------------------------
+# Maintenance windows (planned alert suppression)
+# ---------------------------------------------------------------------------
+
+
+class MaintenanceWindowError(ValueError):
+    """A maintenance window configuration is invalid."""
+
+
+def _validate_maintenance_window(raw: Any, seen_ids: set) -> dict:
+    if not isinstance(raw, dict):
+        raise MaintenanceWindowError("invalid maintenance_window")
+    window_id = raw.get("window_id")
+    if not (isinstance(window_id, str) and window_id != ""):
+        raise MaintenanceWindowError("invalid maintenance_window")
+    if window_id in seen_ids:
+        raise MaintenanceWindowError("invalid maintenance_window")
+    start_ms = raw.get("start_ms")
+    end_ms = raw.get("end_ms")
+    # Non-negative finite numbers; booleans are rejected by _is_number.
+    if not (_is_number(start_ms) and math.isfinite(start_ms) and start_ms >= 0):
+        raise MaintenanceWindowError("invalid maintenance_window")
+    if not (_is_number(end_ms) and math.isfinite(end_ms) and end_ms >= 0):
+        raise MaintenanceWindowError("invalid maintenance_window")
+    if not end_ms > start_ms:
+        raise MaintenanceWindowError("invalid maintenance_window")
+    source = raw.get("source")
+    name = raw.get("name")
+    labels = raw.get("labels")
+    has_condition = False
+    if source is not None:
+        if not (isinstance(source, str) and source != ""):
+            raise MaintenanceWindowError("invalid maintenance_window")
+        has_condition = True
+    if name is not None:
+        if not (isinstance(name, str) and name != ""):
+            raise MaintenanceWindowError("invalid maintenance_window")
+        has_condition = True
+    if labels is not None:
+        if not isinstance(labels, dict):
+            raise MaintenanceWindowError("invalid maintenance_window")
+        # Only the keys are constrained (non-empty strings); label values use
+        # exact equality against the alert's same-named fields and may be any
+        # JSON value.
+        for key in labels:
+            if not (isinstance(key, str) and key != ""):
+                raise MaintenanceWindowError("invalid maintenance_window")
+        has_condition = True
+    # source/name/labels are all optional, but at least one must be present.
+    if not has_condition:
+        raise MaintenanceWindowError("invalid maintenance_window")
+    seen_ids.add(window_id)
+    return {
+        "window_id": window_id,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "source": source,
+        "name": name,
+        "labels": dict(labels) if labels is not None else None,
+    }
+
+
+def _validate_maintenance_windows(raw: Any) -> list:
+    """Validate a list of maintenance windows (all or nothing)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise MaintenanceWindowError("invalid maintenance_window")
+    seen_ids: set = set()
+    return [_validate_maintenance_window(item, seen_ids) for item in raw]
+
+
+def _maintenance_suppressed_ids(alerts: list, windows: list) -> set:
+    """Return ids of alerts whose timestamp falls inside a matching window.
+
+    Only the alert timestamp is judged; windows are left-closed/right-open
+    (``start_ms <= timestamp_ms < end_ms``). Present conditions must all hit
+    the alert's same-named fields.
+    """
+    suppressed_ids: set = set()
+    for alert in alerts:
+        timestamp_ms = alert["timestamp_ms"]
+        for window in windows:
+            if not (window["start_ms"] <= timestamp_ms < window["end_ms"]):
+                continue
+            if window["source"] is not None and alert["source"] != window["source"]:
+                continue
+            if window["name"] is not None and alert["name"] != window["name"]:
+                continue
+            if window["labels"] is not None and any(
+                alert["labels"].get(key) != value for key, value in window["labels"].items()
+            ):
+                continue
+            suppressed_ids.add(alert["alert_id"])
+            break
+    return suppressed_ids
+
+
 def process(
     request: dict,
     *,
@@ -910,6 +1008,13 @@ def process(
     if raw_window_rules is not None:
         validated_window_rules = _validate_window_rules(raw_window_rules)
 
+    # Maintenance windows likewise stay dormant unless explicitly provided;
+    # the whole batch is validated up front (all or nothing).
+    raw_maintenance_windows = request.get("maintenance_windows")
+    validated_maintenance_windows: list | None = None
+    if raw_maintenance_windows is not None:
+        validated_maintenance_windows = _validate_maintenance_windows(raw_maintenance_windows)
+
     raw_metrics = request.get("metrics")
     raw_alerts = request.get("alerts")
     if not isinstance(raw_metrics, list) or not isinstance(raw_alerts, list):
@@ -928,10 +1033,19 @@ def process(
         engine.set_rules(validated_window_rules)
         window_suppressed_ids = _feed_window_events(engine, metrics, alerts)
 
+    # Maintenance windows judge only alert timestamps and are independent of
+    # any engine state.
+    maintenance_suppressed_ids: set = set()
+    if validated_maintenance_windows is not None:
+        maintenance_suppressed_ids = _maintenance_suppressed_ids(
+            alerts, validated_maintenance_windows
+        )
+
     result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, suppression_ms)
-    if window_suppressed_ids:
+    extra_suppressed_ids = window_suppressed_ids | maintenance_suppressed_ids
+    if extra_suppressed_ids:
         for entry in result_alerts:
-            if entry["alert_id"] in window_suppressed_ids:
+            if entry["alert_id"] in extra_suppressed_ids:
                 entry["suppressed"] = True
         suppressed_alert_ids = [entry["alert_id"] for entry in result_alerts if entry["suppressed"]]
 
@@ -947,16 +1061,17 @@ def process(
 
     target_registry = _default_registry if registry is None else registry
     result = _process_with_explanations(alerts, series, rules, target_registry)
-    if engine is not None:
+    if extra_suppressed_ids:
         for output_alert in result["alerts"]:
-            if output_alert["alert_id"] in window_suppressed_ids:
+            if output_alert["alert_id"] in extra_suppressed_ids:
                 output_alert["status"] = "suppressed"
-        merged_ids = set(result["suppressed_alert_ids"]) | window_suppressed_ids
+        merged_ids = set(result["suppressed_alert_ids"]) | extra_suppressed_ids
         result["suppressed_alert_ids"] = [
             output_alert["alert_id"]
             for output_alert in result["alerts"]
             if output_alert["alert_id"] in merged_ids
         ]
+    if engine is not None:
         result["suppression_states"] = engine.query()
     return result
 
@@ -1031,6 +1146,7 @@ class MetricBatchService:
         enable_explanations: bool = False,
         registry: ExplanationRegistry | None = None,
         window_suppression_rules: list | None = None,
+        maintenance_windows: list | None = None,
     ) -> None:
         if downsample_ms is not None and (not _is_int(downsample_ms) or downsample_ms <= 0):
             raise ValueError("invalid downsample_ms")
@@ -1045,6 +1161,10 @@ class MetricBatchService:
                 raise ValueError("invalid suppression rules")
             seen_rule_ids: set = set()
             rules = [_validate_suppression_rule(raw, seen_rule_ids) for raw in raw_rules]
+
+        # Maintenance windows are configuration, validated up front (all or
+        # nothing); an invalid set prevents construction entirely.
+        self._maintenance_windows = _validate_maintenance_windows(maintenance_windows)
 
         self._downsample_ms = downsample_ms
         self._suppression_ms = suppression_ms
@@ -1422,6 +1542,15 @@ class MetricBatchService:
         """
         self._window_engine.set_rules(rules)
 
+    def set_maintenance_windows(self, windows: list | None) -> None:
+        """Replace the maintenance window set (all or nothing).
+
+        Validation runs before the stored configuration is touched, so an
+        invalid batch leaves the existing windows in place.
+        """
+        validated = _validate_maintenance_windows(windows)
+        self._maintenance_windows = validated
+
     def query_suppression_states(
         self,
         rule_id: str | None = None,
@@ -1448,15 +1577,23 @@ class MetricBatchService:
                 alert["source"], alert["name"], alert["labels"], alert["timestamp_ms"]
             )
         }
+        # Maintenance windows are re-judged against the current alert set on
+        # every query, so late corrections and retractions take effect at once.
+        maintenance_suppressed_ids = (
+            _maintenance_suppressed_ids(alerts, self._maintenance_windows)
+            if self._maintenance_windows
+            else set()
+        )
+        extra_suppressed_ids = window_suppressed_ids | maintenance_suppressed_ids
         if self._enable_explanations:
             result = _process_with_explanations(
                 alerts, self.query_series(), self._rules, self._registry
             )
-            if window_suppressed_ids:
+            if extra_suppressed_ids:
                 for output_alert in result["alerts"]:
-                    if output_alert["alert_id"] in window_suppressed_ids:
+                    if output_alert["alert_id"] in extra_suppressed_ids:
                         output_alert["status"] = "suppressed"
-                merged_ids = set(result["suppressed_alert_ids"]) | window_suppressed_ids
+                merged_ids = set(result["suppressed_alert_ids"]) | extra_suppressed_ids
                 result["suppressed_alert_ids"] = [
                     output_alert["alert_id"]
                     for output_alert in result["alerts"]
@@ -1464,9 +1601,9 @@ class MetricBatchService:
                 ]
             return result
         result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, self._suppression_ms)
-        if window_suppressed_ids:
+        if extra_suppressed_ids:
             for entry in result_alerts:
-                if entry["alert_id"] in window_suppressed_ids:
+                if entry["alert_id"] in extra_suppressed_ids:
                     entry["suppressed"] = True
             suppressed_alert_ids = [
                 entry["alert_id"] for entry in result_alerts if entry["suppressed"]

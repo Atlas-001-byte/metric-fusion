@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .core import (
     BatchError,
     EventTimestampError,
+    MaintenanceWindowError,
     MetricBatchService,
     RuleConfigurationError,
     process,
@@ -24,6 +25,7 @@ RETRACT_PREFIX = "/v1/metric_batches/"
 RETRACT_SUFFIX = "/retract"
 WINDOW_RULES_PATH = "/v1/window_suppression_rules"
 WINDOW_SUPPRESSIONS_PATH = "/v1/window_suppressions"
+MAINTENANCE_WINDOWS_PATH = "/v1/maintenance_windows"
 
 
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -57,6 +59,13 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 _send_error(self, exc.status, exc.code, str(exc))
             except RuleConfigurationError as exc:
                 _send_error(self, 400, "rule_configuration_error", str(exc))
+            except MaintenanceWindowError:
+                _send_error(
+                    self,
+                    400,
+                    "invalid_maintenance_window",
+                    "invalid maintenance_window",
+                )
             except ValueError as exc:  # legacy path validation errors
                 _send_error(self, 400, "invalid_request", str(exc))
             else:
@@ -72,6 +81,24 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 _send_error(self, exc.status, exc.code, str(exc))
             except RuleConfigurationError as exc:
                 _send_error(self, 400, "rule_configuration_error", str(exc))
+            else:
+                _send_json(self, 200, {"status": "ok"})
+
+        def _handle_maintenance_windows(self) -> None:
+            try:
+                body = self._read_json()
+                windows = (
+                    body.get("maintenance_windows") if isinstance(body, dict) else body
+                )
+                with lock:
+                    service.set_maintenance_windows(windows)
+            except MaintenanceWindowError:
+                _send_error(
+                    self,
+                    400,
+                    "invalid_maintenance_window",
+                    "invalid maintenance_window",
+                )
             else:
                 _send_json(self, 200, {"status": "ok"})
 
@@ -119,6 +146,8 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 self._handle_batch()
             elif path == WINDOW_RULES_PATH:
                 self._handle_window_rules()
+            elif path == MAINTENANCE_WINDOWS_PATH:
+                self._handle_maintenance_windows()
             elif path.startswith(RETRACT_PREFIX):
                 batch_id = self._retract_batch_id(path)
                 if batch_id is None:
@@ -137,6 +166,13 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                     _send_error(self, exc.status, exc.code, str(exc))
                 except RuleConfigurationError as exc:
                     _send_error(self, 400, "rule_configuration_error", str(exc))
+                except MaintenanceWindowError:
+                    _send_error(
+                        self,
+                        400,
+                        "invalid_maintenance_window",
+                        "invalid maintenance_window",
+                    )
                 except EventTimestampError as exc:
                     _send_error(self, 400, "event_timestamp_error", str(exc))
                 except ValueError as exc:
@@ -167,8 +203,11 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 _send_error(self, 404, "not_found", "not found")
 
         def do_PUT(self) -> None:  # noqa: N802 - stdlib handler API
-            if urlsplit(self.path).path == WINDOW_RULES_PATH:
+            path = urlsplit(self.path).path
+            if path == WINDOW_RULES_PATH:
                 self._handle_window_rules()
+            elif path == MAINTENANCE_WINDOWS_PATH:
+                self._handle_maintenance_windows()
             else:
                 _send_error(self, 404, "not_found", "not found")
 
