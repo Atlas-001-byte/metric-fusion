@@ -131,6 +131,31 @@ query_window_suppressions(rule_id="cpu-flap", now_ms=60000)
 - 错误：时间戳缺失、持续时长为负、抑制时长或恢复时长为负、来源为空、指标名匹配条件为空、标签匹配条件非法（含 `rule_id` 为空或重复）统一抛 `RuleConfigurationError`；处理事件遇到无法排序的时间戳（非数值、非有限或为负）抛 `EventTimestampError`。两者均为 `ValueError` 子类；校验失败为整批拒绝，不产生部分效果。HTTP 下分别返回 400，`code` 为 `rule_configuration_error` / `event_timestamp_error`。
 - HTTP：`PUT`/`POST /v1/window_suppression_rules`（请求体为规则列表或 `{"rules": [...]}`，整体替换配置）；`GET /v1/window_suppressions?rule_id=&source=&now_ms=` 返回 `{"suppression_states": [...]}`。
 
+## 计划维护窗口（可选）
+
+在请求中加入 `maintenance_windows`（窗口数组）即启用计划维护期间的告警抑制；缺省不提供时，输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验该配置。
+
+窗口形如：
+
+```json
+{
+  "window_id": "db-patching",
+  "start_ms": 1700000000000,
+  "end_ms": 1700003600000,
+  "source": "agent-a",
+  "name": "cpu.usage",
+  "labels": {"host": "db-1"}
+}
+```
+
+- `window_id` 为非空字符串，同一批配置内不得重复；`start_ms` / `end_ms` 为非负有限数值且 `end_ms > start_ms`，区间为左闭右开 `[start_ms, end_ms)`。
+- `source`、`name`、`labels` 为匹配条件：`source` / `name` 提供时为非空字符串并精确匹配告警同名字段；`labels` 为键非空的映射，作为子集条件全部命中告警 `labels`。三者均可省略，但至少提供一个；所有提供的条件必须同时命中。
+- 判定只看告警的 `timestamp_ms`：命中任一窗口的告警进入抑制结果，与既有 `suppression_ms` 抑制及时间窗抑制取并集，`suppressed_alert_ids` 不重复；告警字段与顺序不变，解释模式下沿用现有 `status` 表达（`suppressed`），不产生解释记录。
+- `process` 请求可直接携带 `maintenance_windows`；`MetricBatchService(maintenance_windows=[...])` 构造时接收配置，`service.set_maintenance_windows(windows)` 全量替换（`None` 清空），`service.reset()` 清空数据但保留配置。批次迟到修正或撤回后重新查询时按当前告警集重新判定。
+- series、聚合（`aggregations`）、来源法定人数（`source_quorum`）与查询过滤不读取维护窗口；批次应用/撤回请求不携带该配置。
+- 校验：配置或字段非法时，库调用与无状态处理抛 `ValueError("invalid maintenance_window")`；CLI 输出该消息并以 2 退出；HTTP 返回 400，`{"code": "invalid_maintenance_window", "message": "invalid maintenance_window"}`。校验为整批全有或全无，失败时已有配置保持不变，无部分效果。
+- HTTP：`PUT`/`POST /v1/maintenance_windows`，请求体为窗口数组或 `{"maintenance_windows": [...]}`，整批校验通过后一次替换，成功返回 `{"status": "ok"}`。
+
 ## 指标批次补丁与迟到修正（有状态服务）
 
 `MetricBatchService` 在内存中维护指标流状态，接受带批次标识的指标样本批次，支持幂等应用与迟到数据修正；不增加任何落盘文件或持久化入口。
