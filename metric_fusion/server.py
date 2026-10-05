@@ -113,13 +113,23 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             raw = self.rfile.read(length) if length else b""
             if raw.strip():
                 try:
-                    json.loads(raw.decode("utf-8"))
+                    parsed = json.loads(raw.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     _send_error(
                         self,
                         400,
                         "metric_batch_retract_invalid",
                         "invalid request",
+                    )
+                    return
+                # Query-time source failover is never accepted by batch
+                # operations: only query_series reads source_priority.
+                if isinstance(parsed, dict) and "source_priority" in parsed:
+                    _send_error(
+                        self,
+                        400,
+                        "metric_batch_retract_invalid",
+                        "invalid source_priority",
                     )
                     return
             try:
@@ -178,6 +188,7 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                             aggregations=body.get("aggregations"),
                             source_quorum=body.get("source_quorum"),
                             source_weights=body.get("source_weights"),
+                            source_priority=body.get("source_priority"),
                         )
                 except BatchError as exc:
                     _send_error(self, exc.status, exc.code, str(exc))

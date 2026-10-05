@@ -190,6 +190,35 @@ def _validate_weight_entries(raw: Any) -> dict:
     return weights
 
 
+def _validate_source_priority(raw: Any) -> dict:
+    """Validate a ``source_priority`` mapping of exact metric name to an ordered
+    list of source names.
+
+    Returns ``{}`` for an absent/None mapping. Each target must map to a
+    non-empty list of non-empty source strings with no source repeated. Anything
+    invalid raises ``ValueError("invalid source_priority")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("invalid source_priority")
+    validated: dict = {}
+    for key, sources in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid source_priority")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("invalid source_priority")
+        ordered: list = []
+        for source in sources:
+            if not (isinstance(source, str) and source != ""):
+                raise ValueError("invalid source_priority")
+            if source in ordered:
+                raise ValueError("invalid source_priority")
+            ordered.append(source)
+        validated[key] = ordered
+    return validated
+
+
 def _new_bucket() -> dict:
     return {
         "sum": 0.0,
@@ -198,6 +227,8 @@ def _new_bucket() -> dict:
         "min": None,
         "max": None,
         "last": None,
+        # source -> [sum, count, min, max, last]; every extra statistic beyond
+        # sum/count is needed only by priority failover aggregation.
         "per_source": {},
     }
 
@@ -208,9 +239,18 @@ def _bucket_add(bucket: dict, source: str, timestamp_ms: Any, value: Any) -> Non
     bucket["sources"].add(source)
     per_source = bucket["per_source"].get(source)
     if per_source is None:
-        per_source = bucket["per_source"][source] = [0.0, 0]
+        per_source = bucket["per_source"][source] = [0.0, 0, None, None, None]
     per_source[0] += value
     per_source[1] += 1
+    source_min = per_source[2]
+    if source_min is None or value < source_min:
+        per_source[2] = value
+    source_max = per_source[3]
+    if source_max is None or value > source_max:
+        per_source[3] = value
+    source_last = per_source[4]
+    if source_last is None or timestamp_ms > source_last[0]:
+        per_source[4] = (timestamp_ms, value)
     if bucket["min"] is None or value < bucket["min"]:
         bucket["min"] = value
     if bucket["max"] is None or value > bucket["max"]:
@@ -247,12 +287,12 @@ def _weighted_bucket_value(bucket: dict, weights: dict):
     """
     numerator = 0.0
     denominator = 0.0
-    for source, (source_sum, source_count) in bucket["per_source"].items():
+    for source, stats in bucket["per_source"].items():
         weight = weights.get(source)
         if weight is None or weight <= 0:
             continue
-        numerator += source_sum * weight
-        denominator += source_count * weight
+        numerator += stats[0] * weight
+        denominator += stats[1] * weight
     if denominator == 0:
         return None
     return round(numerator / denominator + 0.0, 6)  # normalize -0.0
@@ -279,12 +319,62 @@ def _weighted_row(name: str, labels_key: str, start: Any, bucket: dict, weights:
     return row
 
 
+def _source_stats_value(stats: list, func: str) -> float:
+    """Aggregate one winning source's window samples with ``func``."""
+    source_sum, source_count, source_min, source_max, source_last = stats
+    if func == "min":
+        value = source_min
+    elif func == "max":
+        value = source_max
+    elif func == "sum":
+        value = source_sum
+    elif func == "last":
+        value = source_last[1]
+    else:  # avg
+        value = source_sum / source_count
+    return round(value + 0.0, 6)  # normalize -0.0
+
+
+def _priority_row(
+    name: str, labels_key: str, start: Any, bucket: dict, priorities: list, func: str
+) -> dict:
+    """Failover row for a priority-configured target.
+
+    The quorum check has already passed against the full deduplicated source
+    set. The first configured source that actually has a winning sample in the
+    window provides every sample of the row; sources not configured for the
+    target never participate. If none of the configured sources appears, the
+    row is emitted with a null value and ``priority_missing``.
+    """
+    winner = next((source for source in priorities if source in bucket["per_source"]), None)
+    if winner is None:
+        return {
+            "name": name,
+            "labels": json.loads(labels_key),
+            "timestamp_ms": start,
+            "value": None,
+            "count": 0,
+            "sources": [],
+            "priority_missing": True,
+        }
+    stats = bucket["per_source"][winner]
+    return {
+        "name": name,
+        "labels": json.loads(labels_key),
+        "timestamp_ms": start,
+        "value": _source_stats_value(stats, func),
+        "count": stats[1],
+        "sources": [winner],
+    }
+
+
 def _downsample(
     metrics: list,
     downsample_ms: int,
     aggregations: dict | None = None,
     source_quorum: dict | None = None,
     source_weights: dict | None = None,
+    source_priority: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -322,6 +412,11 @@ def _downsample(
             # Weight-enabled targets merge by configured source weights; the
             # aggregation-function selection does not apply to them.
             series.append(_weighted_row(name, labels_key, start, bucket, weights))
+            continue
+        priorities = source_priority.get(name) if source_priority else None
+        if priorities is not None:
+            func = aggregations.get(name, "avg") if aggregations else "avg"
+            series.append(_priority_row(name, labels_key, start, bucket, priorities, func))
             continue
         func = aggregations.get(name, "avg") if aggregations else "avg"
         series.append(
@@ -1092,6 +1187,13 @@ def process(
     # absent from the mapping keep the default equal-weight merge.
     source_weights = _validate_source_weights(request.get("source_weights"))
 
+    # Optional per-target ordered source failover; validated up front like the
+    # other per-metric query options. The same metric target cannot be tuned by
+    # both weights and priority.
+    source_priority = _validate_source_priority(request.get("source_priority"))
+    if source_priority.keys() & source_weights.keys():
+        raise ValueError("invalid source_priority")
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1129,7 +1231,14 @@ def process(
     seen_ids: set = set()
     alerts = [_validate_alert(alert, seen_ids) for alert in raw_alerts]
 
-    series = _downsample(metrics, downsample_ms, aggregations, source_quorum, source_weights)
+    series = _downsample(
+        metrics,
+        downsample_ms,
+        aggregations,
+        source_quorum,
+        source_weights,
+        source_priority,
+    )
 
     window_suppressed_ids: set = set()
     engine: WindowSuppressionEngine | None = None
@@ -1321,6 +1430,11 @@ class MetricBatchService:
             return process(request)
         if not (isinstance(batch_id, str) and batch_id != ""):
             raise BatchError(400, "metric_batch_invalid", "invalid batch_id")
+
+        # Per-query source failover is never part of a batch: applying (or
+        # retracting) a batch must neither persist nor silently accept it.
+        if "source_priority" in request:
+            raise BatchError(400, "metric_batch_invalid", "invalid source_priority")
 
         max_event_time_ms = request.get("max_event_time_ms")
         if not _valid_timestamp(max_event_time_ms):
@@ -1574,6 +1688,7 @@ class MetricBatchService:
         aggregations: dict | None = None,
         source_quorum: dict | None = None,
         source_weights: dict | None = None,
+        source_priority: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -1587,6 +1702,12 @@ class MetricBatchService:
         target merges each window as the weighted sum of its participating
         samples divided by the effective weight sum, and windows without
         effective weight are marked ``weight_missing`` with a null value.
+        ``source_priority`` maps exact metric names to ordered source lists:
+        a quorum-passing window of such a target uses only the first configured
+        source that actually appears in the window (failover), aggregating
+        that source's samples; windows with none of the configured sources are
+        marked ``priority_missing`` with a null value. The same metric may not
+        appear in both ``source_weights`` and ``source_priority``.
         Output rows keep the existing fields and the existing
         (name, labels, timestamp) order.
         """
@@ -1600,6 +1721,9 @@ class MetricBatchService:
         agg_map = _validate_aggregations(aggregations)
         quorum_map = _validate_source_quorum(source_quorum)
         weights_map = _validate_source_weights(source_weights)
+        priority_map = _validate_source_priority(source_priority)
+        if priority_map.keys() & weights_map.keys():
+            raise ValueError("invalid source_priority")
 
         rows = []
         for (bucket_name, labels_key, start), bucket in self._buckets.items():
@@ -1625,6 +1749,19 @@ class MetricBatchService:
             weights = weights_map.get(bucket_name)
             if weights is not None:
                 rows.append(_weighted_row(bucket_name, labels_key, start, bucket, weights))
+                continue
+            priorities = priority_map.get(bucket_name)
+            if priorities is not None:
+                rows.append(
+                    _priority_row(
+                        bucket_name,
+                        labels_key,
+                        start,
+                        bucket,
+                        priorities,
+                        agg_map.get(bucket_name, "avg"),
+                    )
+                )
                 continue
             rows.append(
                 {

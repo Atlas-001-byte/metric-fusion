@@ -72,6 +72,25 @@ python -m metric_fusion request.json > result.json
 - 校验：`source_weights` 必须是字符串到权重配置的映射，键非空；每个目标至少配置一个来源，权重为大于等于零的有限数值（不能为布尔值、负数、非有限数），同一来源不得重复配置。非法时库调用抛 `ValueError("invalid source_weights")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_weights"}`，CLI 输出 `invalid source_weights` 并以 2 退出。校验为全有或全无，失败时不加载任何部分配置、不改变已有状态。
 - 样本校验沿用既有口径：缺少来源、指标目标或时间戳、数值为非有限数时抛出样本无效异常（库为 `ValueError("invalid metric")` / `ValueError("invalid value")`，批次 API 为 400 `metric_batch_invalid`）并拒绝该条样本；校验先于任何状态变更，已接受的其他样本与既有查询结果不受影响。
 
+## 按指标来源优先级故障切换（可选）
+
+`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `source_priority` 映射：键为精确指标名，值为按优先级排序的来源名数组。窗口内只采用**优先级最高且在窗口中实际出现的来源**，未命中映射的指标仍走现有（等权重或 `source_weights`）归并，未提供时行为完全不变。
+
+```json
+"source_priority": {
+  "cpu.usage": ["agent-a", "agent-b", "agent-c"]
+}
+```
+
+- 处理顺序：先按 `source/name/labels/timestamp_ms` 覆盖顺序去重，再按 `timestamp_ms // downsample_ms * downsample_ms` 划窗；`source_quorum` 仍用**选择前的完整去重来源集**判断（包括未列入优先级的来源）。
+- 达到 quorum 阈值后，命中配置的窗口按数组顺序取**第一个在窗口中有胜者样本的来源**，只用该来源的全部去重样本按 `aggregations` 的 `avg`、`min`、`max`、`sum`、`last` 计算（未配置聚合函数时取 `avg`）；`last` 只在获胜来源内部取时间戳最大的样本。
+- 输出沿用现有值域与命名（`name/labels/timestamp_ms/value/count/sources`）：`value` 仍 `round(value, 6)` 且 `-0.0` 归一，排序、`name/labels/start_ms/end_ms` 查询过滤不变；`count` 与 `sources` 只含最终选中来源的样本与来源（即获胜来源自身）。
+- 配置的来源在窗口内均无样本时（窗口仍可因其他来源存在而通过 quorum），输出 `"value": null`、`"count": 0`、`"sources": []` 及 `"priority_missing": true`；正常行不带该字段。窗口没有任何样本时继续沿用无数据语义（不产生行）。
+- 每个窗口独立故障切换：同一指标一个窗口走主来源、另一个窗口走备份来源互不影响。去重、窗口起点、迟到修正与批次秩语义不变；有状态服务在补丁、迟到修正或撤回后重新查询时按当前胜者样本重新选择来源。
+- `source_priority` 与 `source_weights` 不得配置同一指标（不同指标可共存）。同一指标冲突或配置本身非法时，库调用抛 `ValueError("invalid source_priority")`；配置必须是非空指标键到非空、来源不重复的非空字符串数组的映射。
+- `POST /v1/query` 返回 400 与 `{"code": "invalid_request", "message": "invalid source_priority"}`；CLI 输出 `invalid source_priority`、以 2 退出且不改变已有状态。校验为全有或全无。
+- 只有 `query_series` 读取该配置：批次应用（`POST /v1/metric_batches` 中带 `batch_id` 的请求）与撤回（`POST /v1/metric_batches/{batch_id}/retract`）继续拒绝 `source_priority`（分别为 400 `metric_batch_invalid` / 400 `metric_batch_retract_invalid`，消息为 `invalid source_priority`）；幂等、批次秩、`affected_streams`、`recomputed_windows`、`GET /v1/series`、`GET /v1/alerts`、告警抑制（含解释、时间窗规则）与维护窗口保持既有行为，均不读取该配置。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。
