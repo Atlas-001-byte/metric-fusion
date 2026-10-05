@@ -36,9 +36,10 @@ python -m metric_fusion request.json > result.json
 
 ## 按指标选择窗口聚合函数（可选）
 
-`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `aggregations` 映射：键为精确指标名，值只能是 `avg`、`min`、`max`、`sum`、`last`。未命中映射的指标仍用 `avg`，未提供 `aggregations` 时行为与基线完全一致。
+`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `aggregations` 映射：键为精确指标名，值只能是 `avg`、`min`、`max`、`sum`、`last`、`median`、`p95`、`p99`。未命中映射的指标仍用 `avg`，未提供 `aggregations` 时行为与基线完全一致。
 
-- 去重（`source/name/labels/timestamp_ms` 后覆盖先）与窗口起点（`timestamp_ms // downsample_ms * downsample_ms`）不变；同 `name` + 规范 labels 的窗口内：`avg/min/max/sum` 分别取平均、最小、最大、总和；`last` 取 `timestamp_ms` 最大的样本，时间相同取 `source` 字典序最大者。
+- 去重（`source/name/labels/timestamp_ms` 后覆盖先）与窗口起点（`timestamp_ms // downsample_ms * downsample_ms`）不变；同一窗口先按既有规则得到去重样本，再计算所选函数。同 `name` + 规范 labels 的窗口内：`avg/min/max/sum` 分别取平均、最小、最大、总和；`last` 取 `timestamp_ms` 最大的样本，时间相同取 `source` 字典序最大者。
+- 分布型函数：`median` 取排序后中间值，样本数为偶数时取中间两值的算术平均；`p95`、`p99` 分别取 `ceil(0.95*n)`、`ceil(0.99*n)` 的一基最近秩（1-based nearest rank）样本，不做插值。三个函数都只依赖排序后的去重样本，样本到达顺序不影响结果。
 - 输出字段不变（`name/labels/timestamp_ms/value/count/sources`，不增加聚合类型字段），`count` 仍是去重样本数，`sources` 去重排序，`value` 仍 `round(value, 6)` 且 `-0.0` 统一为 `0`；排序不变。
 - 有状态服务在补丁、迟到修正与批次撤回后按当前胜者样本重算所选函数；批次秩、幂等、`affected_streams`、`recomputed_windows`、告警重裁与顺序无关语义不变。聚合只影响选定的 series 查询：`GET /v1/series`、`GET /v1/alerts` 与告警抑制不读取该配置。
 - 校验：`aggregations` 不是字符串到允许函数名的映射、键为空串或值不支持时，库调用抛 `ValueError("invalid aggregation")`；HTTP 返回 400，`{"code": "invalid_request", "message": "invalid aggregation"}`；CLI 输出该消息并以 2 退出。校验失败不部分修改状态。
@@ -83,7 +84,7 @@ python -m metric_fusion request.json > result.json
 ```
 
 - 处理顺序：先按 `source/name/labels/timestamp_ms` 覆盖顺序去重，再按 `timestamp_ms // downsample_ms * downsample_ms` 划窗；`source_quorum` 仍用**选择前的完整去重来源集**判断（包括未列入优先级的来源）。
-- 达到 quorum 阈值后，命中配置的窗口按数组顺序取**第一个在窗口中有胜者样本的来源**，只用该来源的全部去重样本按 `aggregations` 的 `avg`、`min`、`max`、`sum`、`last` 计算（未配置聚合函数时取 `avg`）；`last` 只在获胜来源内部取时间戳最大的样本。
+- 达到 quorum 阈值后，命中配置的窗口按数组顺序取**第一个在窗口中有胜者样本的来源**，只用该来源的全部去重样本按 `aggregations` 的 `avg`、`min`、`max`、`sum`、`last`、`median`、`p95`、`p99` 计算（未配置聚合函数时取 `avg`）；`last` 只在获胜来源内部取时间戳最大的样本，`median/p95/p99` 只对该来源的窗口去重样本排序取秩。
 - 输出沿用现有值域与命名（`name/labels/timestamp_ms/value/count/sources`）：`value` 仍 `round(value, 6)` 且 `-0.0` 归一，排序、`name/labels/start_ms/end_ms` 查询过滤不变；`count` 与 `sources` 只含最终选中来源的样本与来源（即获胜来源自身）。
 - 配置的来源在窗口内均无样本时（窗口仍可因其他来源存在而通过 quorum），输出 `"value": null`、`"count": 0`、`"sources": []` 及 `"priority_missing": true`；正常行不带该字段。窗口没有任何样本时继续沿用无数据语义（不产生行）。
 - 每个窗口独立故障切换：同一指标一个窗口走主来源、另一个窗口走备份来源互不影响。去重、窗口起点、迟到修正与批次秩语义不变；有状态服务在补丁、迟到修正或撤回后重新查询时按当前胜者样本重新选择来源。
