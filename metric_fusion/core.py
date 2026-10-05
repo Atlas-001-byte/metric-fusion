@@ -11,7 +11,7 @@ from typing import Any
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
 
-AGGREGATION_FUNCTIONS = ("avg", "min", "max", "sum", "last")
+AGGREGATION_FUNCTIONS = ("avg", "min", "max", "sum", "last", "median", "p95", "p99")
 
 _ALERT_FIELDS = ("source", "name", "labels", "alert_id", "rule", "timestamp_ms", "severity")
 
@@ -227,8 +227,12 @@ def _new_bucket() -> dict:
         "min": None,
         "max": None,
         "last": None,
-        # source -> [sum, count, min, max, last]; every extra statistic beyond
-        # sum/count is needed only by priority failover aggregation.
+        # Deduplicated sample values of the window, needed by the order-based
+        # aggregation functions (median/p95/p99). Arrival order is irrelevant:
+        # every such function sorts before selecting.
+        "values": [],
+        # source -> [sum, count, min, max, last, values]; every extra statistic
+        # beyond sum/count is needed only by priority failover aggregation.
         "per_source": {},
     }
 
@@ -237,11 +241,13 @@ def _bucket_add(bucket: dict, source: str, timestamp_ms: Any, value: Any) -> Non
     bucket["sum"] += value
     bucket["count"] += 1
     bucket["sources"].add(source)
+    bucket["values"].append(value)
     per_source = bucket["per_source"].get(source)
     if per_source is None:
-        per_source = bucket["per_source"][source] = [0.0, 0, None, None, None]
+        per_source = bucket["per_source"][source] = [0.0, 0, None, None, None, []]
     per_source[0] += value
     per_source[1] += 1
+    per_source[5].append(value)
     source_min = per_source[2]
     if source_min is None or value < source_min:
         per_source[2] = value
@@ -262,6 +268,22 @@ def _bucket_add(bucket: dict, source: str, timestamp_ms: Any, value: Any) -> Non
         bucket["last"] = (timestamp_ms, source, value)
 
 
+def _median(values: list) -> float:
+    """Median of a non-empty sample list; an even count averages the middle pair."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _nearest_rank(values: list, quantile: float) -> float:
+    """One-based nearest-rank quantile (no interpolation): rank ``ceil(q*n)``."""
+    ordered = sorted(values)
+    rank = math.ceil(quantile * len(ordered))
+    return ordered[rank - 1]
+
+
 def _bucket_value(bucket: dict, func: str) -> float:
     if func == "min":
         value = bucket["min"]
@@ -271,6 +293,12 @@ def _bucket_value(bucket: dict, func: str) -> float:
         value = bucket["sum"]
     elif func == "last":
         value = bucket["last"][2]
+    elif func == "median":
+        value = _median(bucket["values"])
+    elif func == "p95":
+        value = _nearest_rank(bucket["values"], 0.95)
+    elif func == "p99":
+        value = _nearest_rank(bucket["values"], 0.99)
     else:  # avg
         value = bucket["sum"] / bucket["count"]
     return round(value + 0.0, 6)  # normalize -0.0
@@ -321,7 +349,7 @@ def _weighted_row(name: str, labels_key: str, start: Any, bucket: dict, weights:
 
 def _source_stats_value(stats: list, func: str) -> float:
     """Aggregate one winning source's window samples with ``func``."""
-    source_sum, source_count, source_min, source_max, source_last = stats
+    source_sum, source_count, source_min, source_max, source_last, source_values = stats
     if func == "min":
         value = source_min
     elif func == "max":
@@ -330,6 +358,12 @@ def _source_stats_value(stats: list, func: str) -> float:
         value = source_sum
     elif func == "last":
         value = source_last[1]
+    elif func == "median":
+        value = _median(source_values)
+    elif func == "p95":
+        value = _nearest_rank(source_values, 0.95)
+    elif func == "p99":
+        value = _nearest_rank(source_values, 0.99)
     else:  # avg
         value = source_sum / source_count
     return round(value + 0.0, 6)  # normalize -0.0
@@ -1694,8 +1728,11 @@ class MetricBatchService:
 
         Optional filters: exact metric name, label subset match, and a
         ``[start_ms, end_ms]`` range over window start times. ``aggregations``
-        maps exact metric names to ``avg``/``min``/``max``/``sum``/``last``;
-        unmapped metrics keep the default ``avg``. ``source_quorum`` maps exact
+        maps exact metric names to one of ``avg``/``min``/``max``/``sum``/
+        ``last``/``median``/``p95``/``p99``; unmapped metrics keep the default
+        ``avg``. ``median`` averages the two middle values for an even sample
+        count; ``p95``/``p99`` use the one-based nearest rank ``ceil(q*n)``
+        without interpolation. ``source_quorum`` maps exact
         metric names to positive integers: a window is output only when its
         deduplicated source set reaches the threshold. ``source_weights`` maps
         exact metric names to per-source weight configurations: a listed
