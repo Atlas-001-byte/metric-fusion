@@ -72,6 +72,22 @@ python -m metric_fusion request.json > result.json
 - 校验：`source_weights` 必须是字符串到权重配置的映射，键非空；每个目标至少配置一个来源，权重为大于等于零的有限数值（不能为布尔值、负数、非有限数），同一来源不得重复配置。非法时库调用抛 `ValueError("invalid source_weights")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_weights"}`，CLI 输出 `invalid source_weights` 并以 2 退出。校验为全有或全无，失败时不加载任何部分配置、不改变已有状态。
 - 样本校验沿用既有口径：缺少来源、指标目标或时间戳、数值为非有限数时抛出样本无效异常（库为 `ValueError("invalid metric")` / `ValueError("invalid value")`，批次 API 为 400 `metric_batch_invalid`）并拒绝该条样本；校验先于任何状态变更，已接受的其他样本与既有查询结果不受影响。
 
+## 按指标目标的来源优先级故障切换（可选）
+
+`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `source_priority` 映射：键为精确指标名，值为有序来源名数组。窗口内只取优先级最高且实际出现的来源；未命中映射的指标维持现有归并行为，输出字段与形状完全不变。
+
+```json
+"source_priority": {
+  "cpu.usage": ["agent-a", "agent-b"]
+}
+```
+
+- 处理顺序不变：先按 `source/name/labels/timestamp_ms` 覆盖去重，再按 `timestamp_ms // downsample_ms * downsample_ms` 划窗；`source_quorum` 仍用选择前的完整去重来源集判断，达到阈值后才进行来源选择。
+- 命中配置的窗口按数组顺序取第一个有（胜者）样本的来源，只用该来源的全部样本按 `aggregations` 的 `avg/min/max/sum/last` 计算（未配置时取 `avg`）；`count` 与 `sources` 只含最终样本和来源。`value` 仍 `round(value, 6)` 且 `-0.0` 归一，排序与查询过滤沿用既有口径。
+- 配置来源在窗口内均无样本时，输出 `value` 为 `null`、`count` 为 0、`sources` 为空数组并附 `"priority_missing": true` 标记（正常窗口行不含该字段）；窗口内没有任何样本时继续沿用现有无数据语义（不产生窗口行）。
+- 有状态服务只有 `query_series` 读取该配置；批次应用与撤回继续拒绝 `source_priority`，补丁、迟到修正、幂等、批次秩、`affected_streams`、`recomputed_windows`、`GET /v1/series`、`GET /v1/alerts`、告警抑制和维护窗口保持既有行为。
+- 校验：`source_priority` 必须是非空映射，键为非空指标名，值为非空且来源不重复的数组；与 `source_weights` 配置同一指标视为冲突。非法或冲突时库调用抛 `ValueError("invalid source_priority")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_priority"}`，CLI 输出 `invalid source_priority` 并以 2 退出。校验为全有或全无，失败时不改变已有状态。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。

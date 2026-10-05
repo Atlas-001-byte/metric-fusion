@@ -190,6 +190,37 @@ def _validate_weight_entries(raw: Any) -> dict:
     return weights
 
 
+def _validate_source_priority(raw: Any, source_weights: dict | None = None) -> dict:
+    """Validate a ``source_priority`` mapping of exact metric name to ordered sources.
+
+    Returns ``{}`` for an absent/None mapping (every metric keeps the existing
+    merge). The mapping must be non-empty, each key a non-empty string, and
+    each value a non-empty list of distinct non-empty source names. A metric
+    configured in both ``source_priority`` and ``source_weights`` is a
+    conflict. Anything invalid raises ``ValueError("invalid source_priority")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("invalid source_priority")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid source_priority")
+        if not isinstance(value, list) or not value:
+            raise ValueError("invalid source_priority")
+        sources: list = []
+        for source in value:
+            if not (isinstance(source, str) and source != "") or source in sources:
+                raise ValueError("invalid source_priority")
+            sources.append(source)
+        validated[key] = sources
+    if source_weights and any(key in source_weights for key in validated):
+        # Failover and weighted merging are mutually exclusive per target.
+        raise ValueError("invalid source_priority")
+    return validated
+
+
 def _new_bucket() -> dict:
     return {
         "sum": 0.0,
@@ -202,15 +233,28 @@ def _new_bucket() -> dict:
     }
 
 
+def _new_source_stats() -> dict:
+    # Same shape as the aggregate fields of a bucket, so ``_bucket_value``
+    # computes over a single source's samples directly.
+    return {"sum": 0.0, "count": 0, "min": None, "max": None, "last": None}
+
+
 def _bucket_add(bucket: dict, source: str, timestamp_ms: Any, value: Any) -> None:
     bucket["sum"] += value
     bucket["count"] += 1
     bucket["sources"].add(source)
-    per_source = bucket["per_source"].get(source)
-    if per_source is None:
-        per_source = bucket["per_source"][source] = [0.0, 0]
-    per_source[0] += value
-    per_source[1] += 1
+    stats = bucket["per_source"].get(source)
+    if stats is None:
+        stats = bucket["per_source"][source] = _new_source_stats()
+    stats["sum"] += value
+    stats["count"] += 1
+    if stats["min"] is None or value < stats["min"]:
+        stats["min"] = value
+    if stats["max"] is None or value > stats["max"]:
+        stats["max"] = value
+    # Within one source, deduplication guarantees unique timestamps.
+    if stats["last"] is None or timestamp_ms > stats["last"][0]:
+        stats["last"] = (timestamp_ms, source, value)
     if bucket["min"] is None or value < bucket["min"]:
         bucket["min"] = value
     if bucket["max"] is None or value > bucket["max"]:
@@ -247,12 +291,12 @@ def _weighted_bucket_value(bucket: dict, weights: dict):
     """
     numerator = 0.0
     denominator = 0.0
-    for source, (source_sum, source_count) in bucket["per_source"].items():
+    for source, stats in bucket["per_source"].items():
         weight = weights.get(source)
         if weight is None or weight <= 0:
             continue
-        numerator += source_sum * weight
-        denominator += source_count * weight
+        numerator += stats["sum"] * weight
+        denominator += stats["count"] * weight
     if denominator == 0:
         return None
     return round(numerator / denominator + 0.0, 6)  # normalize -0.0
@@ -268,7 +312,7 @@ def _weighted_row(name: str, labels_key: str, start: Any, bucket: dict, weights:
         "labels": json.loads(labels_key),
         "timestamp_ms": start,
         "value": value,
-        "count": sum(bucket["per_source"][source][1] for source in participating),
+        "count": sum(bucket["per_source"][source]["count"] for source in participating),
         "sources": sorted(participating),
     }
     if value is None:
@@ -279,12 +323,47 @@ def _weighted_row(name: str, labels_key: str, start: Any, bucket: dict, weights:
     return row
 
 
+def _priority_row(name: str, labels_key: str, start: Any, bucket: dict, priority: list, func: str) -> dict:
+    """Failover merge of a window: only the highest-priority source present.
+
+    The first configured source with (winning) samples in the window supplies
+    every sample; all other sources are ignored. When none of the configured
+    sources appears, the window is marked ``priority_missing`` with a null
+    value instead of emitting a number.
+    """
+    chosen = None
+    for source in priority:
+        if source in bucket["per_source"]:
+            chosen = source
+            break
+    if chosen is None:
+        return {
+            "name": name,
+            "labels": json.loads(labels_key),
+            "timestamp_ms": start,
+            "value": None,
+            "count": 0,
+            "sources": [],
+            "priority_missing": True,
+        }
+    stats = bucket["per_source"][chosen]
+    return {
+        "name": name,
+        "labels": json.loads(labels_key),
+        "timestamp_ms": start,
+        "value": _bucket_value(stats, func),
+        "count": stats["count"],
+        "sources": [chosen],
+    }
+
+
 def _downsample(
     metrics: list,
     downsample_ms: int,
     aggregations: dict | None = None,
     source_quorum: dict | None = None,
     source_weights: dict | None = None,
+    source_priority: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -324,6 +403,12 @@ def _downsample(
             series.append(_weighted_row(name, labels_key, start, bucket, weights))
             continue
         func = aggregations.get(name, "avg") if aggregations else "avg"
+        priority = source_priority.get(name) if source_priority else None
+        if priority is not None:
+            # Failover targets keep only the highest-priority source present
+            # in the window and aggregate that source's samples alone.
+            series.append(_priority_row(name, labels_key, start, bucket, priority, func))
+            continue
         series.append(
             {
                 "name": name,
@@ -1092,6 +1177,12 @@ def process(
     # absent from the mapping keep the default equal-weight merge.
     source_weights = _validate_source_weights(request.get("source_weights"))
 
+    # Optional per-target source failover order; validated up front (all or
+    # nothing) like the other optional configs. A target listed here must not
+    # also appear in source_weights. Targets absent from the mapping keep the
+    # existing merge.
+    source_priority = _validate_source_priority(request.get("source_priority"), source_weights)
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1129,7 +1220,7 @@ def process(
     seen_ids: set = set()
     alerts = [_validate_alert(alert, seen_ids) for alert in raw_alerts]
 
-    series = _downsample(metrics, downsample_ms, aggregations, source_quorum, source_weights)
+    series = _downsample(metrics, downsample_ms, aggregations, source_quorum, source_weights, source_priority)
 
     window_suppressed_ids: set = set()
     engine: WindowSuppressionEngine | None = None
@@ -1574,6 +1665,7 @@ class MetricBatchService:
         aggregations: dict | None = None,
         source_quorum: dict | None = None,
         source_weights: dict | None = None,
+        source_priority: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -1587,8 +1679,12 @@ class MetricBatchService:
         target merges each window as the weighted sum of its participating
         samples divided by the effective weight sum, and windows without
         effective weight are marked ``weight_missing`` with a null value.
-        Output rows keep the existing fields and the existing
-        (name, labels, timestamp) order.
+        ``source_priority`` maps exact metric names to an ordered source list:
+        a listed target fails over to the first configured source with winning
+        samples in the window and aggregates that source's samples alone;
+        windows where no configured source appears are marked
+        ``priority_missing`` with a null value. Output rows keep the existing
+        fields and the existing (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
             raise ValueError("invalid name")
@@ -1600,6 +1696,7 @@ class MetricBatchService:
         agg_map = _validate_aggregations(aggregations)
         quorum_map = _validate_source_quorum(source_quorum)
         weights_map = _validate_source_weights(source_weights)
+        priority_map = _validate_source_priority(source_priority, weights_map)
 
         rows = []
         for (bucket_name, labels_key, start), bucket in self._buckets.items():
@@ -1625,6 +1722,19 @@ class MetricBatchService:
             weights = weights_map.get(bucket_name)
             if weights is not None:
                 rows.append(_weighted_row(bucket_name, labels_key, start, bucket, weights))
+                continue
+            priority = priority_map.get(bucket_name)
+            if priority is not None:
+                rows.append(
+                    _priority_row(
+                        bucket_name,
+                        labels_key,
+                        start,
+                        bucket,
+                        priority,
+                        agg_map.get(bucket_name, "avg"),
+                    )
+                )
                 continue
             rows.append(
                 {
