@@ -190,6 +190,28 @@ def _validate_weight_entries(raw: Any) -> dict:
     return weights
 
 
+def _validate_gap_fill(raw: Any) -> dict:
+    """Validate a ``gap_fill`` mapping of exact metric name to ``max_gap_ms``.
+
+    Returns ``{}`` for an absent/None mapping (no gap filling). Keys must be
+    non-empty strings and values positive integers — booleans, zero, negatives
+    and floats are rejected. Anything invalid raises
+    ``ValueError("invalid gap_fill")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid gap_fill")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid gap_fill")
+        if not (_is_int(value) and value > 0):
+            raise ValueError("invalid gap_fill")
+        validated[key] = value
+    return validated
+
+
 def _validate_source_priority(raw: Any) -> dict:
     """Validate a ``source_priority`` mapping of exact metric name to an ordered
     list of source names.
@@ -402,6 +424,51 @@ def _priority_row(
     }
 
 
+def _fill_series_gaps(series: list, downsample_ms: int, gap_fill: dict, blocked: set) -> list:
+    """Insert fill rows between adjacent output windows of the same series.
+
+    ``series`` is the already sorted output (name, canonical labels, window
+    start). For a configured metric, when two adjacent output windows of the
+    same normalized series satisfy ``gap = next_start - start - downsample_ms
+    <= max_gap_ms``, every missing window start in between gets a row whose
+    value is carried over from the previous window, with ``count`` 0 and an
+    empty ``sources`` list. Slots in ``blocked`` (windows dropped by
+    ``source_quorum``) are never resurrected by a fill row. Nothing is added
+    before the first or after the last output window of a series, and gaps
+    beyond ``max_gap_ms`` stay empty.
+    """
+    if not gap_fill:
+        return series
+    result = []
+    for index, row in enumerate(series):
+        result.append(row)
+        max_gap_ms = gap_fill.get(row["name"])
+        if max_gap_ms is None or index + 1 >= len(series):
+            continue
+        series_key = (row["name"], _canonical_labels(row["labels"]))
+        nxt = series[index + 1]
+        if (nxt["name"], _canonical_labels(nxt["labels"])) != series_key:
+            continue
+        start = row["timestamp_ms"]
+        if nxt["timestamp_ms"] - start - downsample_ms > max_gap_ms:
+            continue
+        fill_start = start + downsample_ms
+        while fill_start < nxt["timestamp_ms"]:
+            if (row["name"], series_key[1], fill_start) not in blocked:
+                result.append(
+                    {
+                        "name": row["name"],
+                        "labels": dict(row["labels"]),
+                        "timestamp_ms": fill_start,
+                        "value": row["value"],
+                        "count": 0,
+                        "sources": [],
+                    }
+                )
+            fill_start += downsample_ms
+    return result
+
+
 def _downsample(
     metrics: list,
     downsample_ms: int,
@@ -409,6 +476,7 @@ def _downsample(
     source_quorum: dict | None = None,
     source_weights: dict | None = None,
     source_priority: dict | None = None,
+    gap_fill: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -434,12 +502,14 @@ def _downsample(
         _bucket_add(bucket, source, timestamp_ms, value)
 
     series = []
+    quorum_blocked: set = set()
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
         bucket = buckets[(name, labels_key, start)]
         # The quorum threshold is judged against the full deduplicated source
         # set of the window — never the sample or request count. Windows below
         # the threshold are dropped entirely: no fill points or partial rows.
         if source_quorum and name in source_quorum and len(bucket["sources"]) < source_quorum[name]:
+            quorum_blocked.add((name, labels_key, start))
             continue
         weights = source_weights.get(name) if source_weights else None
         if weights is not None:
@@ -463,6 +533,8 @@ def _downsample(
                 "sources": sorted(bucket["sources"]),
             }
         )
+    if gap_fill:
+        series = _fill_series_gaps(series, downsample_ms, gap_fill, quorum_blocked)
     return series
 
 
@@ -1228,6 +1300,10 @@ def process(
     if source_priority.keys() & source_weights.keys():
         raise ValueError("invalid source_priority")
 
+    # Optional per-metric gap filling of the series output; validated up front
+    # (all or nothing) like every other optional query configuration.
+    gap_fill = _validate_gap_fill(request.get("gap_fill"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1272,6 +1348,7 @@ def process(
         source_quorum,
         source_weights,
         source_priority,
+        gap_fill,
     )
 
     window_suppressed_ids: set = set()
@@ -1723,6 +1800,7 @@ class MetricBatchService:
         source_quorum: dict | None = None,
         source_weights: dict | None = None,
         source_priority: dict | None = None,
+        gap_fill: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -1745,6 +1823,13 @@ class MetricBatchService:
         that source's samples; windows with none of the configured sources are
         marked ``priority_missing`` with a null value. The same metric may not
         appear in both ``source_weights`` and ``source_priority``.
+        ``gap_fill`` maps exact metric names to a positive integer
+        ``max_gap_ms``: after all of the above, missing windows between two
+        adjacent output windows of the same normalized series are filled
+        (value carried over from the previous window, ``count`` 0, empty
+        ``sources``) whenever the gap does not exceed ``max_gap_ms``; windows
+        dropped by ``source_quorum`` are never resurrected, and nothing is
+        filled before the first or after the last output window.
         Output rows keep the existing fields and the existing
         (name, labels, timestamp) order.
         """
@@ -1761,8 +1846,10 @@ class MetricBatchService:
         priority_map = _validate_source_priority(source_priority)
         if priority_map.keys() & weights_map.keys():
             raise ValueError("invalid source_priority")
+        gap_fill_map = _validate_gap_fill(gap_fill)
 
         rows = []
+        quorum_blocked: set = set()
         for (bucket_name, labels_key, start), bucket in self._buckets.items():
             if name is not None and bucket_name != name:
                 continue
@@ -1782,6 +1869,7 @@ class MetricBatchService:
                 bucket_name in quorum_map
                 and len(bucket["sources"]) < quorum_map[bucket_name]
             ):
+                quorum_blocked.add((bucket_name, labels_key, start))
                 continue
             weights = weights_map.get(bucket_name)
             if weights is not None:
@@ -1811,6 +1899,10 @@ class MetricBatchService:
                 }
             )
         rows.sort(key=lambda row: (row["name"], _canonical_labels(row["labels"]), row["timestamp_ms"]))
+        if gap_fill_map and self._downsample_ms is not None:
+            # A service without downsample_ms can never hold samples, so there
+            # are no windows to fill between.
+            rows = _fill_series_gaps(rows, self._downsample_ms, gap_fill_map, quorum_blocked)
         return rows
 
     # -- window suppression rules --------------------------------------------
