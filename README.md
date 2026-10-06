@@ -106,6 +106,21 @@ python -m metric_fusion request.json > result.json
 - 有状态服务在补丁、迟到修正或撤回后重新查询时，按当前胜者样本与配置重算补点；排序、`round(value, 6)` 与 `-0.0` 归一语义不变。
 - 校验：`gap_fill` 必须是精确指标名到正整数的映射，键非空，值不能为布尔值、零、负数或浮点数。非法时库调用抛 `ValueError("invalid gap_fill")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid gap_fill"}`，CLI 输出 `invalid gap_fill` 并以 2 退出。校验失败不部分修改状态。
 
+## 按指标降采样周期（可选）
+
+`process`、`POST /process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `downsample_overrides` 映射：键为精确指标名，值为正整数毫秒周期。`downsample_ms` 仍是默认周期，批次接收窗口与统计口径不变；该配置只改变序列查询的窗口划分。未提供或指标名未命中时行为与基线完全一致。
+
+```json
+"downsample_overrides": {"cpu.usage": 2000}
+```
+
+- 样本仍按 `source/name/labels/timestamp_ms` 后覆盖先去重；命中配置的指标按 `timestamp_ms // period * period` 划窗，未命中的指标仍按 `downsample_ms` 划窗。
+- `avg/min/max/sum/last/median/p95/p99`、`source_quorum`、`source_weights`、`source_priority` 与 `gap_fill` 沿用既有次序和语义；输出字段、`round(value, 6)`、`-0.0` 归一及（name、规范 labels、timestamp_ms）排序不变。
+- `gap_fill` 按指标自身周期计算缺失窗口：命中配置的指标用其周期，其余用 `downsample_ms`，不同指标可有不同周期，不做全局对齐。
+- 有状态服务在补丁、迟到修正或撤回后重新查询时，按当前批次胜者样本重算命中序列；批次应用与撤回仍按服务构造时的 `downsample_ms` 计算范围、幂等、批次秩、`affected_streams` 与 `recomputed_windows`。
+- `GET /v1/series`、`GET /v1/alerts` 与告警抑制（含解释、时间窗规则、维护窗口）不读取该配置。
+- 校验：`downsample_overrides` 必须是精确指标名到正整数的映射，键非空，值不能为布尔值、零、负数、浮点数或非有限数。非法时库调用抛 `ValueError("invalid downsample_override")`，`POST /process` 与 `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid downsample_override"}`，CLI 输出 `invalid downsample_override` 并以 2 退出。校验失败不产生部分配置或部分结果。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。
