@@ -190,6 +190,7 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                             source_weights=body.get("source_weights"),
                             source_priority=body.get("source_priority"),
                             gap_fill=body.get("gap_fill"),
+                            downsample_overrides=body.get("downsample_overrides"),
                         )
                 except BatchError as exc:
                     _send_error(self, exc.status, exc.code, str(exc))

@@ -92,6 +92,21 @@ python -m metric_fusion request.json > result.json
 - `POST /v1/query` 返回 400 与 `{"code": "invalid_request", "message": "invalid source_priority"}`；CLI 输出 `invalid source_priority`、以 2 退出且不改变已有状态。校验为全有或全无。
 - 只有 `query_series` 读取该配置：批次应用（`POST /v1/metric_batches` 中带 `batch_id` 的请求）与撤回（`POST /v1/metric_batches/{batch_id}/retract`）继续拒绝 `source_priority`（分别为 400 `metric_batch_invalid` / 400 `metric_batch_retract_invalid`，消息为 `invalid source_priority`）；幂等、批次秩、`affected_streams`、`recomputed_windows`、`GET /v1/series`、`GET /v1/alerts`、告警抑制（含解释、时间窗规则）与维护窗口保持既有行为，均不读取该配置。
 
+## 按指标独立降采样周期（可选）
+
+`process`、`POST /process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `downsample_overrides` 映射：键为精确指标名，值为正整数毫秒周期。`downsample_ms` 仍是默认周期，批次接收窗口与统计口径不变；该配置只改变序列查询的窗口划分。未提供或未命中的指标行为与基线完全一致。
+
+```json
+"downsample_overrides": {"cpu.usage": 500}
+```
+
+- 样本仍按 `source/name/labels/timestamp_ms` 后覆盖先去重；命中配置的指标按 `timestamp_ms // period * period` 划窗，未命中的指标仍按 `downsample_ms` 划窗。
+- `avg/min/max/sum/last/median/p95/p99`、`source_quorum`、`source_weights`、`source_priority` 与 `gap_fill` 沿用既有次序和语义；输出字段、`round(value, 6)`、`-0.0` 归一及 name、规范 labels、timestamp_ms 排序不变。
+- `gap_fill` 按指标自身周期计算缺失窗口：命中 `downsample_overrides` 的指标按其周期补点，其余指标按 `downsample_ms` 补点，不同指标可有不同周期，不全局对齐。
+- 有状态服务的 `query_series` 按当前批次胜者样本重算命中序列，补丁、迟到修正和撤回后反映当前结果；批次应用与撤回仍按服务构造时的 `downsample_ms` 计算范围、幂等、批次秩、`affected_streams` 和 `recomputed_windows`。
+- `GET /v1/series`、`GET /v1/alerts` 与告警抑制不读取该配置。
+- 校验：`downsample_overrides` 必须是精确指标名到正整数的映射，键非空，值不能为布尔值、零、负数、浮点数或非有限数。非法时库调用抛 `ValueError("invalid downsample_override")`，`POST /process` 与 `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid downsample_override"}`，CLI 输出 `invalid downsample_override` 并以 2 退出。校验失败不产生部分配置或部分结果。
+
 ## 窗口缺口补点（可选）
 
 `process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `gap_fill` 映射：键为精确指标名，值为正整数 `max_gap_ms`。去重、窗口边界、聚合、来源权重、优先级与 `source_quorum` 全部执行完后，再在同一规范化序列（`name` + 规范 labels）的相邻**已输出**窗口之间补点，让稀疏序列有可预测的时间轴。未提供 `gap_fill` 时行为与基线完全一致。

@@ -212,6 +212,29 @@ def _validate_gap_fill(raw: Any) -> dict:
     return validated
 
 
+def _validate_downsample_overrides(raw: Any) -> dict:
+    """Validate a ``downsample_overrides`` mapping of exact metric name to period.
+
+    Returns ``{}`` for an absent/None mapping (every metric uses the default
+    ``downsample_ms``). Keys must be non-empty strings and values positive
+    integer millisecond periods — booleans, zero, negatives, floats and
+    non-finite numbers are rejected. Anything invalid raises
+    ``ValueError("invalid downsample_override")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid downsample_override")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid downsample_override")
+        if not (_is_int(value) and value > 0):
+            raise ValueError("invalid downsample_override")
+        validated[key] = value
+    return validated
+
+
 def _validate_source_priority(raw: Any) -> dict:
     """Validate a ``source_priority`` mapping of exact metric name to an ordered
     list of source names.
@@ -424,18 +447,27 @@ def _priority_row(
     }
 
 
-def _fill_series_gaps(series: list, downsample_ms: int, gap_fill: dict, blocked: set) -> list:
+def _fill_series_gaps(
+    series: list,
+    downsample_ms: int,
+    gap_fill: dict,
+    blocked: set,
+    downsample_overrides: dict | None = None,
+) -> list:
     """Insert fill rows between adjacent output windows of the same series.
 
     ``series`` is the already sorted output (name, canonical labels, window
     start). For a configured metric, when two adjacent output windows of the
-    same normalized series satisfy ``gap = next_start - start - downsample_ms
+    same normalized series satisfy ``gap = next_start - start - period
     <= max_gap_ms``, every missing window start in between gets a row whose
     value is carried over from the previous window, with ``count`` 0 and an
-    empty ``sources`` list. Slots in ``blocked`` (windows dropped by
-    ``source_quorum``) are never resurrected by a fill row. Nothing is added
-    before the first or after the last output window of a series, and gaps
-    beyond ``max_gap_ms`` stay empty.
+    empty ``sources`` list. ``period`` is the metric's own downsample period:
+    its ``downsample_overrides`` entry when configured, else the default
+    ``downsample_ms`` — different metrics may fill on different periods and
+    are never aligned to a global grid. Slots in ``blocked`` (windows dropped
+    by ``source_quorum``) are never resurrected by a fill row. Nothing is
+    added before the first or after the last output window of a series, and
+    gaps beyond ``max_gap_ms`` stay empty.
     """
     if not gap_fill:
         return series
@@ -449,10 +481,14 @@ def _fill_series_gaps(series: list, downsample_ms: int, gap_fill: dict, blocked:
         nxt = series[index + 1]
         if (nxt["name"], _canonical_labels(nxt["labels"])) != series_key:
             continue
+        if downsample_overrides:
+            period = downsample_overrides.get(row["name"], downsample_ms)
+        else:
+            period = downsample_ms
         start = row["timestamp_ms"]
-        if nxt["timestamp_ms"] - start - downsample_ms > max_gap_ms:
+        if nxt["timestamp_ms"] - start - period > max_gap_ms:
             continue
-        fill_start = start + downsample_ms
+        fill_start = start + period
         while fill_start < nxt["timestamp_ms"]:
             if (row["name"], series_key[1], fill_start) not in blocked:
                 result.append(
@@ -465,7 +501,7 @@ def _fill_series_gaps(series: list, downsample_ms: int, gap_fill: dict, blocked:
                         "sources": [],
                     }
                 )
-            fill_start += downsample_ms
+            fill_start += period
     return result
 
 
@@ -477,6 +513,7 @@ def _downsample(
     source_weights: dict | None = None,
     source_priority: dict | None = None,
     gap_fill: dict | None = None,
+    downsample_overrides: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -493,7 +530,13 @@ def _downsample(
 
     buckets: dict = {}
     for (source, name, labels_key, timestamp_ms), value in points.items():
-        start = (timestamp_ms // downsample_ms) * downsample_ms
+        # Metrics with a configured override bucket on their own period;
+        # everything else uses the default downsample_ms.
+        if downsample_overrides:
+            period = downsample_overrides.get(name, downsample_ms)
+        else:
+            period = downsample_ms
+        start = (timestamp_ms // period) * period
         bucket_key = (name, labels_key, start)
         bucket = buckets.get(bucket_key)
         if bucket is None:
@@ -534,7 +577,7 @@ def _downsample(
             }
         )
     if gap_fill:
-        series = _fill_series_gaps(series, downsample_ms, gap_fill, quorum_blocked)
+        series = _fill_series_gaps(series, downsample_ms, gap_fill, quorum_blocked, downsample_overrides)
     return series
 
 
@@ -1304,6 +1347,11 @@ def process(
     # (all or nothing) like every other optional query configuration.
     gap_fill = _validate_gap_fill(request.get("gap_fill"))
 
+    # Optional per-metric downsample periods overriding downsample_ms for
+    # series windowing only; validated up front (all or nothing) so a rejected
+    # configuration leaves nothing partially applied.
+    downsample_overrides = _validate_downsample_overrides(request.get("downsample_overrides"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1349,6 +1397,7 @@ def process(
         source_weights,
         source_priority,
         gap_fill,
+        downsample_overrides,
     )
 
     window_suppressed_ids: set = set()
@@ -1801,6 +1850,7 @@ class MetricBatchService:
         source_weights: dict | None = None,
         source_priority: dict | None = None,
         gap_fill: dict | None = None,
+        downsample_overrides: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -1830,7 +1880,16 @@ class MetricBatchService:
         ``sources``) whenever the gap does not exceed ``max_gap_ms``; windows
         dropped by ``source_quorum`` are never resurrected, and nothing is
         filled before the first or after the last output window.
-        Output rows keep the existing fields and the existing
+        ``downsample_overrides`` maps exact metric names to positive integer
+        millisecond periods: a listed metric's windows are recomputed from
+        the current winning samples with ``timestamp_ms // period * period``
+        as the window start (so patches, late corrections and retractions are
+        reflected), while unlisted metrics keep the windows computed with the
+        service's ``downsample_ms``. Gap filling uses each metric's own
+        period; different metrics never align to a common grid. Batch
+        application and retraction keep using the service ``downsample_ms``
+        for ranges, ranks and affected-window accounting regardless of this
+        mapping. Output rows keep the existing fields and the existing
         (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
@@ -1847,10 +1906,39 @@ class MetricBatchService:
         if priority_map.keys() & weights_map.keys():
             raise ValueError("invalid source_priority")
         gap_fill_map = _validate_gap_fill(gap_fill)
+        override_map = _validate_downsample_overrides(downsample_overrides)
+
+        if override_map:
+            # Metrics with an override are re-windowed from the current
+            # winning samples; every other metric keeps the stored buckets.
+            buckets = {
+                key: bucket
+                for key, bucket in self._buckets.items()
+                if key[0] not in override_map
+            }
+            for point_key in self._points:
+                point_name = point_key[1]
+                period = override_map.get(point_name)
+                if period is None:
+                    continue
+                winner = self._point_winner(point_key)
+                if winner is None:
+                    continue
+                _rank, metric = winner
+                timestamp_ms = point_key[3]
+                start = (timestamp_ms // period) * period
+                bucket_key = (point_name, point_key[2], start)
+                bucket = buckets.get(bucket_key)
+                if bucket is None:
+                    bucket = _new_bucket()
+                    buckets[bucket_key] = bucket
+                _bucket_add(bucket, metric["source"], timestamp_ms, metric["value"])
+        else:
+            buckets = self._buckets
 
         rows = []
         quorum_blocked: set = set()
-        for (bucket_name, labels_key, start), bucket in self._buckets.items():
+        for (bucket_name, labels_key, start), bucket in buckets.items():
             if name is not None and bucket_name != name:
                 continue
             bucket_labels = json.loads(labels_key)
@@ -1902,7 +1990,9 @@ class MetricBatchService:
         if gap_fill_map and self._downsample_ms is not None:
             # A service without downsample_ms can never hold samples, so there
             # are no windows to fill between.
-            rows = _fill_series_gaps(rows, self._downsample_ms, gap_fill_map, quorum_blocked)
+            rows = _fill_series_gaps(
+                rows, self._downsample_ms, gap_fill_map, quorum_blocked, override_map
+            )
         return rows
 
     # -- window suppression rules --------------------------------------------
