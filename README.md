@@ -92,6 +92,17 @@ python -m metric_fusion request.json > result.json
 - `POST /v1/query` 返回 400 与 `{"code": "invalid_request", "message": "invalid source_priority"}`；CLI 输出 `invalid source_priority`、以 2 退出且不改变已有状态。校验为全有或全无。
 - 只有 `query_series` 读取该配置：批次应用（`POST /v1/metric_batches` 中带 `batch_id` 的请求）与撤回（`POST /v1/metric_batches/{batch_id}/retract`）继续拒绝 `source_priority`（分别为 400 `metric_batch_invalid` / 400 `metric_batch_retract_invalid`，消息为 `invalid source_priority`）；幂等、批次秩、`affected_streams`、`recomputed_windows`、`GET /v1/series`、`GET /v1/alerts`、告警抑制（含解释、时间窗规则）与维护窗口保持既有行为，均不读取该配置。
 
+## 窗口补点 gap_fill（可选）
+
+`process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `gap_fill` 映射：键为精确指标名，值为正整数 `max_gap_ms`。未提供 `gap_fill`、或指标名未命中映射时，series 输出与基线完全一致。
+
+- 去重、窗口边界、聚合、来源权重、来源优先级与 `source_quorum` 全部**先执行**；补点只在同一规范化序列（`name` + 规范 labels）的相邻**已输出窗口**之间进行。
+- 设相邻已输出窗口起点为 `t1`、`t2`（`t2 > t1`）：仅当 `t2 - t1 - downsample_ms <= max_gap_ms` 时，在 `t1` 与 `t2` 之间每个缺失窗口起点补一行；补点行 `timestamp_ms` 为该窗口起点，`value` 沿用前一窗口（链式前推），`count` 为 `0`，`sources` 为 `[]`，不含其他额外字段。
+- 序列首窗之前、末窗之后不补；缺口超过 `max_gap_ms` 不补；未配置的指标不补。未达 `source_quorum` 而被丢弃的窗口不能靠补点恢复，且会断开其两侧窗口的补点链。查询时间范围、`name`、`labels` 过滤与排序沿用现有口径，补点行随插入后的既有 `(name, 规范 labels, timestamp_ms)` 顺序排列。
+- 补点仅作用于 series 查询：不参与告警抑制，不改变 `alerts`、`suppressed_alert_ids`、抑制解释、批次响应中的 `affected_streams` 与 `recomputed_windows`；`GET /v1/series`、`GET /v1/alerts` 不读取该配置。
+- 有状态服务在补丁、迟到修正或撤回后重新查询时，按当前胜者样本与当前 `gap_fill` 配置重算补点；`round(value, 6)` 与 `-0.0` 归一、排序语义不变。
+- 校验：`gap_fill` 必须是字符串到正整数的映射，键非空，值不能为布尔值、零、负数或浮点数；非法时库调用抛 `ValueError("invalid gap_fill")`，HTTP `POST /v1/query` 返回 400，响应体为 `{"code": "invalid_request", "message": "invalid gap_fill"}`，CLI 标准错误输出 `invalid gap_fill` 并以 2 退出。校验为全有或全无，失败时不产生部分状态修改。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。

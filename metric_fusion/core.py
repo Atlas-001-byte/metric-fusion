@@ -142,6 +142,27 @@ def _validate_source_quorum(raw: Any) -> dict:
     return validated
 
 
+def _validate_gap_fill(raw: Any) -> dict:
+    """Validate a ``gap_fill`` mapping of exact metric name to max gap.
+
+    Returns ``{}`` for an absent/None mapping (no window is filled). Values
+    must be positive integers — booleans, zero, negatives and floats are
+    rejected. Anything invalid raises ``ValueError("invalid gap_fill")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid gap_fill")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid gap_fill")
+        if not (_is_int(value) and value > 0):
+            raise ValueError("invalid gap_fill")
+        validated[key] = value
+    return validated
+
+
 def _validate_source_weights(raw: Any) -> dict:
     """Validate a ``source_weights`` mapping of exact metric name to per-source weights.
 
@@ -402,6 +423,44 @@ def _priority_row(
     }
 
 
+def _emit_gap_fills(
+    series: list,
+    previous: dict | None,
+    name: str,
+    start: Any,
+    downsample_ms: int,
+    gap_fill: dict | None,
+) -> dict | None:
+    """Append carry-over rows for missing windows between two emitted windows.
+
+    Filling runs only after deduplication, windowing, aggregation, weights,
+    priority and source_quorum have done their work: ``previous`` is the
+    immediately preceding *emitted* window of the same normalized series and
+    the caller guarantees no underlying bucket sits between the two. A window
+    denied by source_quorum therefore breaks the chain instead of being
+    restored. Returns the row the caller should treat as the previous one
+    (the last fill when fills were emitted, else ``previous`` unchanged).
+    """
+    if previous is None or not gap_fill or name not in gap_fill:
+        return previous
+    gap_steps = int(round((start - previous["timestamp_ms"]) / downsample_ms))
+    if gap_steps < 2 or (gap_steps - 1) * downsample_ms > gap_fill[name]:
+        return previous
+    anchor = previous
+    for step in range(1, gap_steps):
+        filled = {
+            "name": name,
+            "labels": previous["labels"],
+            "timestamp_ms": previous["timestamp_ms"] + step * downsample_ms,
+            "value": anchor["value"],
+            "count": 0,
+            "sources": [],
+        }
+        series.append(filled)
+        anchor = filled
+    return anchor
+
+
 def _downsample(
     metrics: list,
     downsample_ms: int,
@@ -409,6 +468,7 @@ def _downsample(
     source_quorum: dict | None = None,
     source_weights: dict | None = None,
     source_priority: dict | None = None,
+    gap_fill: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -434,35 +494,59 @@ def _downsample(
         _bucket_add(bucket, source, timestamp_ms, value)
 
     series = []
+    # Gap filling bridges only adjacent *emitted* windows of one normalized
+    # series. Buckets iterate in (name, labels, start) order, so each series
+    # is a contiguous run; a window denied by source_quorum resets the chain
+    # instead of being restored by a fill.
+    current_key = None
+    last_row = None
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
+        key = (name, labels_key)
+        if key != current_key:
+            current_key = key
+            last_row = None
         bucket = buckets[(name, labels_key, start)]
         # The quorum threshold is judged against the full deduplicated source
         # set of the window — never the sample or request count. Windows below
         # the threshold are dropped entirely: no fill points or partial rows.
         if source_quorum and name in source_quorum and len(bucket["sources"]) < source_quorum[name]:
+            last_row = None
             continue
         weights = source_weights.get(name) if source_weights else None
         if weights is not None:
             # Weight-enabled targets merge by configured source weights; the
             # aggregation-function selection does not apply to them.
-            series.append(_weighted_row(name, labels_key, start, bucket, weights))
+            last_row = _emit_gap_fills(
+                series, last_row, name, start, downsample_ms, gap_fill
+            )
+            row = _weighted_row(name, labels_key, start, bucket, weights)
+            series.append(row)
+            last_row = row
             continue
         priorities = source_priority.get(name) if source_priority else None
         if priorities is not None:
             func = aggregations.get(name, "avg") if aggregations else "avg"
-            series.append(_priority_row(name, labels_key, start, bucket, priorities, func))
+            last_row = _emit_gap_fills(
+                series, last_row, name, start, downsample_ms, gap_fill
+            )
+            row = _priority_row(name, labels_key, start, bucket, priorities, func)
+            series.append(row)
+            last_row = row
             continue
         func = aggregations.get(name, "avg") if aggregations else "avg"
-        series.append(
-            {
-                "name": name,
-                "labels": json.loads(labels_key),
-                "timestamp_ms": start,
-                "value": _bucket_value(bucket, func),
-                "count": bucket["count"],
-                "sources": sorted(bucket["sources"]),
-            }
+        last_row = _emit_gap_fills(
+            series, last_row, name, start, downsample_ms, gap_fill
         )
+        row = {
+            "name": name,
+            "labels": json.loads(labels_key),
+            "timestamp_ms": start,
+            "value": _bucket_value(bucket, func),
+            "count": bucket["count"],
+            "sources": sorted(bucket["sources"]),
+        }
+        series.append(row)
+        last_row = row
     return series
 
 
@@ -1228,6 +1312,10 @@ def process(
     if source_priority.keys() & source_weights.keys():
         raise ValueError("invalid source_priority")
 
+    # Optional per-metric window gap filling; validated up front (all or
+    # nothing) like the other per-metric query options.
+    gap_fill = _validate_gap_fill(request.get("gap_fill"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1272,6 +1360,7 @@ def process(
         source_quorum,
         source_weights,
         source_priority,
+        gap_fill,
     )
 
     window_suppressed_ids: set = set()
@@ -1723,6 +1812,7 @@ class MetricBatchService:
         source_quorum: dict | None = None,
         source_weights: dict | None = None,
         source_priority: dict | None = None,
+        gap_fill: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -1745,6 +1835,12 @@ class MetricBatchService:
         that source's samples; windows with none of the configured sources are
         marked ``priority_missing`` with a null value. The same metric may not
         appear in both ``source_weights`` and ``source_priority``.
+        ``gap_fill`` maps exact metric names to a positive-integer
+        ``max_gap_ms``: between two adjacent emitted windows of the same
+        normalized series, every missing window whose gap stays within the
+        limit is filled with a row carrying the previous window's value,
+        ``count`` 0 and empty ``sources``; windows denied by
+        ``source_quorum`` break the chain.
         Output rows keep the existing fields and the existing
         (name, labels, timestamp) order.
         """
@@ -1761,14 +1857,26 @@ class MetricBatchService:
         priority_map = _validate_source_priority(source_priority)
         if priority_map.keys() & weights_map.keys():
             raise ValueError("invalid source_priority")
+        fill_map = _validate_gap_fill(gap_fill)
 
         rows = []
-        for (bucket_name, labels_key, start), bucket in self._buckets.items():
+        # Like the stateless path, filling bridges only adjacent *emitted*
+        # windows; a quorum-denied bucket (still present in self._buckets)
+        # resets the chain. Iterating the stored buckets in canonical order
+        # makes each normalized series a contiguous run.
+        current_key = None
+        last_row = None
+        for bucket_name, labels_key, start in sorted(self._buckets, key=lambda k: (k[0], k[1], k[2])):
+            key = (bucket_name, labels_key)
+            if key != current_key:
+                current_key = key
+                last_row = None
+            bucket = self._buckets[(bucket_name, labels_key, start)]
             if name is not None and bucket_name != name:
                 continue
             bucket_labels = json.loads(labels_key)
             if labels is not None and any(
-                bucket_labels.get(key) != value for key, value in labels.items()
+                bucket_labels.get(key_) != value for key_, value in labels.items()
             ):
                 continue
             if start_ms is not None and start < start_ms:
@@ -1782,34 +1890,48 @@ class MetricBatchService:
                 bucket_name in quorum_map
                 and len(bucket["sources"]) < quorum_map[bucket_name]
             ):
+                # A denied window cannot be restored by a fill and breaks the
+                # carry chain between the windows around it.
+                last_row = None
                 continue
             weights = weights_map.get(bucket_name)
             if weights is not None:
-                rows.append(_weighted_row(bucket_name, labels_key, start, bucket, weights))
+                last_row = _emit_gap_fills(
+                    rows, last_row, bucket_name, start, self._downsample_ms, fill_map
+                )
+                row = _weighted_row(bucket_name, labels_key, start, bucket, weights)
+                rows.append(row)
+                last_row = row
                 continue
             priorities = priority_map.get(bucket_name)
             if priorities is not None:
-                rows.append(
-                    _priority_row(
-                        bucket_name,
-                        labels_key,
-                        start,
-                        bucket,
-                        priorities,
-                        agg_map.get(bucket_name, "avg"),
-                    )
+                last_row = _emit_gap_fills(
+                    rows, last_row, bucket_name, start, self._downsample_ms, fill_map
                 )
+                row = _priority_row(
+                    bucket_name,
+                    labels_key,
+                    start,
+                    bucket,
+                    priorities,
+                    agg_map.get(bucket_name, "avg"),
+                )
+                rows.append(row)
+                last_row = row
                 continue
-            rows.append(
-                {
-                    "name": bucket_name,
-                    "labels": bucket_labels,
-                    "timestamp_ms": start,
-                    "value": _bucket_value(bucket, agg_map.get(bucket_name, "avg")),
-                    "count": bucket["count"],
-                    "sources": sorted(bucket["sources"]),
-                }
+            last_row = _emit_gap_fills(
+                rows, last_row, bucket_name, start, self._downsample_ms, fill_map
             )
+            row = {
+                "name": bucket_name,
+                "labels": bucket_labels,
+                "timestamp_ms": start,
+                "value": _bucket_value(bucket, agg_map.get(bucket_name, "avg")),
+                "count": bucket["count"],
+                "sources": sorted(bucket["sources"]),
+            }
+            rows.append(row)
+            last_row = row
         rows.sort(key=lambda row: (row["name"], _canonical_labels(row["labels"]), row["timestamp_ms"]))
         return rows
 
