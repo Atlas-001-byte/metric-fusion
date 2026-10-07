@@ -17,12 +17,14 @@ from .core import (
     EventTimestampError,
     MaintenanceWindowError,
     MetricBatchService,
+    RecomputeError,
     RuleConfigurationError,
     process,
 )
 
 RETRACT_PREFIX = "/v1/metric_batches/"
 RETRACT_SUFFIX = "/retract"
+RECOMPUTE_PATH = "/v1/recompute"
 WINDOW_RULES_PATH = "/v1/window_suppression_rules"
 WINDOW_SUPPRESSIONS_PATH = "/v1/window_suppressions"
 SUPPRESSION_AUDIT_PATH = "/v1/suppression_audit"
@@ -40,6 +42,18 @@ def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> N
 
 def _send_error(handler: BaseHTTPRequestHandler, status: int, code: str, message: str) -> None:
     _send_json(handler, status, {"code": code, "message": message})
+
+
+def _send_recompute_error(
+    handler: BaseHTTPRequestHandler, status: int, error: str, request_id
+) -> None:
+    # The recompute entry uses its own stable error envelope; the other
+    # endpoints keep {"code", "message"} untouched.
+    _send_json(
+        handler,
+        status,
+        {"status": status, "error": error, "request_id": request_id},
+    )
 
 
 def _make_handler(service: MetricBatchService, lock: threading.Lock):
@@ -64,6 +78,24 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 _send_error(self, 400, "invalid_maintenance_window", str(exc))
             except ValueError as exc:  # legacy path validation errors
                 _send_error(self, 400, "invalid_request", str(exc))
+            else:
+                _send_json(self, 200, result)
+
+        def _handle_recompute(self) -> None:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8") or "null")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    _send_recompute_error(
+                        self, 400, "invalid_recompute_request", None
+                    )
+                    return
+                with lock:
+                    result = service.recompute(body)
+            except RecomputeError as exc:
+                _send_recompute_error(self, exc.status, exc.error, exc.request_id)
             else:
                 _send_json(self, 200, result)
 
@@ -143,7 +175,9 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
 
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
             path = urlsplit(self.path).path
-            if path == "/v1/metric_batches":
+            if path == RECOMPUTE_PATH:
+                self._handle_recompute()
+            elif path == "/v1/metric_batches":
                 self._handle_batch()
             elif path == WINDOW_RULES_PATH:
                 self._handle_window_rules()
@@ -263,10 +297,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--downsample-ms", type=int, default=None)
     parser.add_argument("--suppression-ms", type=int, default=0)
+    parser.add_argument(
+        "--retention-ms",
+        type=int,
+        default=None,
+        help="maximum age (ms) accepted by the late-data recompute entry",
+    )
     args = parser.parse_args(argv)
 
     service = MetricBatchService(
-        downsample_ms=args.downsample_ms, suppression_ms=args.suppression_ms
+        downsample_ms=args.downsample_ms,
+        suppression_ms=args.suppression_ms,
+        retention_ms=args.retention_ms,
     )
     server = ThreadingHTTPServer(
         (args.host, args.port), _make_handler(service, threading.Lock())

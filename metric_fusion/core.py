@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -1703,6 +1704,16 @@ class BatchError(ValueError):
         self.code = code
 
 
+class RecomputeError(ValueError):
+    """Structured late-data recompute failure carrying an HTTP status and code."""
+
+    def __init__(self, status: int, error: str, request_id: Any) -> None:
+        super().__init__(error)
+        self.status = status
+        self.error = error
+        self.request_id = request_id
+
+
 def _canonical_sample(metric: dict) -> str:
     return json.dumps(
         {
@@ -1743,9 +1754,11 @@ class MetricBatchService:
 
     Samples are kept per stream so that late batches recompute exactly the
     downsample windows they touch; queries always reflect the current state.
-    Point conflicts across batches resolve deterministically by batch rank
-    ``(max_event_time_ms, batch_id)`` — the higher rank wins — so the final
-    aggregates do not depend on batch arrival order.
+    Point conflicts resolve deterministically by a comparable rank —
+    ``(0, max_event_time_ms, batch_id)`` for batches and
+    ``(1, sampling_time, request_id)`` for late recompute points, where the
+    higher rank wins — so the final aggregates do not depend on batch arrival
+    order.
     """
 
     def __init__(
@@ -1757,6 +1770,8 @@ class MetricBatchService:
         registry: ExplanationRegistry | None = None,
         window_suppression_rules: list | None = None,
         maintenance_windows: list | None = None,
+        retention_ms: int | None = None,
+        clock_ms: Any = None,
     ) -> None:
         if downsample_ms is not None and (not _is_int(downsample_ms) or downsample_ms <= 0):
             raise ValueError("invalid downsample_ms")
@@ -1764,6 +1779,20 @@ class MetricBatchService:
             raise ValueError("invalid suppression_ms")
         if not isinstance(enable_explanations, bool):
             raise ValueError("invalid enable_explanations")
+        # Retention is an optional age limit for late-data recomputation: a
+        # point whose sampling time is older than ``now - retention_ms`` is
+        # rejected (404). Absent (None) means no lower age boundary.
+        if retention_ms is not None and not (_is_int(retention_ms) and retention_ms > 0):
+            raise ValueError("invalid retention_ms")
+        # A fixed/injected clock keeps the recompute entry deterministic and
+        # testable; it never changes online intake. ``None`` uses wall time.
+        # A number pins the clock to that value; a zero-argument callable is
+        # invoked for every request.
+        if clock_ms is not None and not (
+            callable(clock_ms)
+            or (_is_number(clock_ms) and math.isfinite(clock_ms) and clock_ms >= 0)
+        ):
+            raise ValueError("invalid clock_ms")
         rules: list = []
         if enable_explanations:
             raw_rules = [] if suppression_rules is None else suppression_rules
@@ -1783,19 +1812,37 @@ class MetricBatchService:
         # Maintenance-window configuration is validated up front; reset()
         # clears data but keeps it, exactly like the window rules above.
         self._maintenance_windows = _validate_maintenance_windows(maintenance_windows)
+        self._retention_ms = retention_ms
+        self._clock_ms_fn = clock_ms if clock_ms is not None else None
         self.reset()
+
+    def _now_ms(self) -> Any:
+        if self._clock_ms_fn is not None:
+            clock = self._clock_ms_fn
+            return clock() if callable(clock) else clock
+        return time.time() * 1000.0
 
     def reset(self) -> None:
         """Drop all applied batches, samples, windows and alerts."""
         self._batches: dict = {}  # batch_id -> batch record
         self._retracted: set = set()  # batch_ids in the terminal retracted state
-        # Each point keeps one candidate per contributing batch rank so that
+        # Each point keeps one candidate per contributing rank so that
         # retracting the winning batch can restore the next-highest rank.
         self._points: dict = {}  # point_key -> {rank: metric}
         self._bucket_points: dict = {}  # bucket_key -> set of point_key
         self._buckets: dict = {}  # bucket_key -> {sum, count, sources}
         self._alerts: list = []
         self._alert_ids: set = set()
+        # Suppression decisions already surfaced by a recompute are confirmed
+        # per alert event id; replaying or re-submitting the same event never
+        # lifts a confirmation nor re-sends a notification.
+        self._confirmed_suppressed: set = set()
+        # Alert event ids already emitted as active notifications: the same
+        # event never produces a second notification.
+        self._notified_events: set = set()
+        # Idempotent recompute requests: request_id -> the exact result and
+        # content fingerprint of the first successful submission.
+        self._recomputes: dict = {}
         self._registry.clear()
         # Recorded window-suppression episodes are state, the configured rules
         # are not: reset clears the former and keeps the latter.
@@ -1901,7 +1948,7 @@ class MetricBatchService:
                         400, "metric_batch_range_invalid", "metric batch range invalid"
                     )
 
-        rank = (max_event_time_ms, batch_id)
+        rank = (0, max_event_time_ms, batch_id)
         # Within one batch, identical points dedupe with the later one winning.
         batch_points: dict = {}
         for metric in metrics:
@@ -2401,3 +2448,297 @@ class MetricBatchService:
             window_rule_hits_by_id=window_hits_by_id,
             maintenance_windows=self._maintenance_windows,
         )
+
+    # -- late-data deterministic recompute -----------------------------------
+
+    def _recompute_fingerprint(self, request_id: str, points: list) -> str:
+        """Order-independent content fingerprint of one recompute request."""
+
+        def canonical(raw: Any) -> str:
+            return json.dumps(raw, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+        payload = "\n".join(
+            ["v2", request_id] + sorted(canonical(point) for point in points)
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _validate_recompute_point(self, raw: Any, request_id: str, now_ms: Any) -> dict:
+        # Structural identity first: request/source/name/sampling-time missing
+        # or unusable all map to the single invalid_recompute_request code.
+        if not isinstance(raw, dict):
+            raise RecomputeError(400, "invalid_recompute_request", request_id)
+        source = raw.get("source")
+        name = raw.get("name")
+        timestamp_ms = raw.get("timestamp_ms")
+        if not (
+            isinstance(source, str)
+            and source != ""
+            and isinstance(name, str)
+            and name != ""
+            and _valid_timestamp(timestamp_ms)
+        ):
+            raise RecomputeError(400, "invalid_recompute_request", request_id)
+        event_id = raw.get("event_id")
+        if event_id is not None and not (isinstance(event_id, str) and event_id != ""):
+            raise RecomputeError(400, "invalid_recompute_request", request_id)
+        value = raw.get("value")
+        if not (_is_number(value) and math.isfinite(value)):
+            raise RecomputeError(400, "invalid_value", request_id)
+        labels = raw.get("labels")
+        if not isinstance(labels, dict):
+            raise RecomputeError(400, "invalid_tags", request_id)
+        # A sampling time older than the existing retention range is a missing
+        # window (404), not a malformed request; both boundaries are inclusive.
+        if self._retention_ms is not None and timestamp_ms < now_ms - self._retention_ms:
+            raise RecomputeError(404, "outside_retention", request_id)
+        if timestamp_ms > now_ms:
+            raise RecomputeError(400, "future_timestamp", request_id)
+        point = {
+            "source": source,
+            "name": name,
+            "labels": labels,
+            "timestamp_ms": timestamp_ms,
+            "value": value,
+        }
+        if event_id is not None:
+            point["event_id"] = event_id
+        return point
+
+    def _bucket_signature(self, bucket_key: tuple):
+        """Complete query-visible fingerprint of one merged window.
+
+        It covers every statistic the downsample readers can expose (avg/min/
+        max/sum/last, count, sources and the per-source breakdown), so a
+        correction counts as a changed bucket whenever any downsample result
+        derived from it could change; ``None`` means the window does not exist.
+        """
+        bucket = self._buckets.get(bucket_key)
+        if bucket is None:
+            return None
+        per_source = tuple(
+            (source, stats[0], stats[1], stats[2], stats[3], stats[4])
+            for source, stats in sorted(bucket["per_source"].items())
+        )
+        return (
+            round(bucket["sum"] + 0.0, 6),
+            bucket["count"],
+            bucket["min"],
+            bucket["max"],
+            bucket["last"],
+            tuple(sorted(bucket["sources"])),
+            per_source,
+        )
+
+    def _build_affected_ranges(self, changed_buckets: list) -> list:
+        """Merge adjacent changed windows of the same name+labels into ranges."""
+        by_series: dict = {}
+        for name, labels_key, start in changed_buckets:
+            by_series.setdefault((name, labels_key), []).append(start)
+        step = self._downsample_ms
+        ranges = []
+        for (name, labels_key), starts in by_series.items():
+            starts.sort()
+            range_start = None
+            range_end = None
+            for start in starts:
+                end = start + step
+                if range_start is None:
+                    range_start, range_end = start, end
+                elif start == range_end:
+                    range_end = end
+                else:
+                    ranges.append((name, labels_key, range_start, range_end))
+                    range_start, range_end = start, end
+            ranges.append((name, labels_key, range_start, range_end))
+        ranges.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [
+            {
+                "name": name,
+                "labels": json.loads(labels_key),
+                "start_ms": start,
+                "end_ms": end,
+            }
+            for name, labels_key, start, end in ranges
+        ]
+
+    def _event_is_suppressed(self, point: dict) -> bool:
+        """Adjudicate one late point-event against the current state.
+
+        Only dimension/time-based suppression applies to recompute events —
+        time-window rules (source/metric/labels/time) and maintenance windows.
+        Recorded window episodes follow online arrival order and are never
+        rewritten by late data, so this is a pure state query, exactly as in
+        query_alerts().
+        """
+        if self._window_engine.is_suppressed(
+            point["source"], point["name"], point["labels"], point["timestamp_ms"]
+        ):
+            return True
+        return any(
+            _maintenance_window_matches(window, point)
+            for window in self._maintenance_windows
+        )
+
+    def recompute(self, request: Any) -> dict:
+        """Merge one batch of late points and adjudicate its alert events.
+
+        Points carry source/name/labels/timestamp_ms/value and an optional
+        ``event_id``; points with an event_id are alert events adjudicated
+        against the post-recompute state. Validation is all-or-nothing: no
+        metric, derived downsample result or notification changes unless every
+        point passes. A replayed ``request_id`` returns the original result
+        verbatim without touching any state.
+        """
+        if not isinstance(request, dict):
+            raise RecomputeError(400, "invalid_recompute_request", None)
+        raw_request_id = request.get("request_id")
+        request_id = (
+            raw_request_id
+            if isinstance(raw_request_id, str) and raw_request_id != ""
+            else None
+        )
+        raw_points = request.get("points")
+
+        # Idempotency is settled before validation: a replayed (or now aged)
+        # duplicate request must still return its original result untouched.
+        if request_id is not None and isinstance(raw_points, list):
+            cached = self._recomputes.get(request_id)
+            if cached is not None:
+                fingerprint = self._recompute_fingerprint(request_id, raw_points)
+                if fingerprint == cached["fingerprint"]:
+                    # A defensive copy keeps the cached result stable even if
+                    # the caller mutates the returned structure.
+                    return copy.deepcopy(cached["result"])
+                raise RecomputeError(409, "recompute_conflict", request_id)
+
+        if request_id is None:
+            raise RecomputeError(400, "invalid_recompute_request", None)
+        if not isinstance(raw_points, list):
+            raise RecomputeError(400, "invalid_recompute_request", request_id)
+        if raw_points and self._downsample_ms is None:
+            raise RecomputeError(400, "invalid_recompute_request", request_id)
+
+        now_ms = self._now_ms()
+
+        # Phase 1: validate every point before touching any state, so an
+        # invalid request writes nothing, derives nothing and notifies nobody.
+        points = [
+            self._validate_recompute_point(raw, request_id, now_ms)
+            for raw in raw_points
+        ]
+
+        # Phase 2: in-batch dedupe. First occurrence is accepted; later
+        # occurrences are duplicates. Conflicts are conflicting_duplicate:
+        # the same (source, name, time) point arriving with a different tag
+        # set, or the exact same logical point arriving with a different
+        # value. Detection order never matters — either order is rejected.
+        unique_points: dict = {}
+        tags_by_identity: dict = {}
+        duplicate_points = 0
+        for point in points:
+            labels_key = _canonical_labels(point["labels"])
+            identity = (point["source"], point["name"], point["timestamp_ms"])
+            seen_labels = tags_by_identity.get(identity)
+            if seen_labels is not None and seen_labels != labels_key:
+                raise RecomputeError(400, "conflicting_duplicate", request_id)
+            tags_by_identity[identity] = labels_key
+            key = (point["source"], point["name"], labels_key, point["timestamp_ms"])
+            existing = unique_points.get(key)
+            if existing is None:
+                unique_points[key] = point
+                continue
+            duplicate_points += 1
+            if existing["value"] != point["value"]:
+                raise RecomputeError(400, "conflicting_duplicate", request_id)
+        accepted_points = len(unique_points)
+
+        # Phase 3: cross-request conflicts. A late identity already corrected
+        # by an earlier recompute request keeps exactly the established label
+        # set and value: resubmitting it with different labels or a different
+        # value is a deterministic 400 conflict that writes nothing and leaves
+        # the established window result untouched. Resubmitting the identical
+        # late point is not a conflict — it is an external duplicate that
+        # leaves the window unchanged and never re-notifies. Correcting an
+        # online-batch value remains the normal late-data case.
+        late_by_identity: dict = {}
+        for candidate_key, candidates in self._points.items():
+            late_rank = next((rank for rank in candidates if rank[0] == 1), None)
+            if late_rank is None:
+                continue
+            identity = (candidate_key[0], candidate_key[1], candidate_key[3])
+            late_by_identity.setdefault(identity, []).append(
+                (candidate_key[2], candidates[late_rank]["value"])
+            )
+        for point_key, point in unique_points.items():
+            identity = (point_key[0], point_key[1], point_key[3])
+            for established_labels, established_value in late_by_identity.get(identity, ()):
+                if established_labels != point_key[2] or established_value != point["value"]:
+                    raise RecomputeError(400, "conflicting_duplicate", request_id)
+
+        # Commit points. Recompute candidates carry rank kind 1, which always
+        # outranks online batch candidates (kind 0); only buckets whose
+        # winning sample set actually changes are recomputed.
+        touched_buckets: set = set()
+        for point_key, point in unique_points.items():
+            candidates = self._points.setdefault(point_key, {})
+            rank = (1, point["timestamp_ms"], request_id)
+            candidates[rank] = point
+            start = (point_key[3] // self._downsample_ms) * self._downsample_ms
+            bucket_key = (point_key[1], point_key[2], start)
+            self._bucket_points.setdefault(bucket_key, set()).add(point_key)
+            touched_buckets.add(bucket_key)
+
+        changed_buckets: list = []
+        for bucket_key in touched_buckets:
+            before = self._bucket_signature(bucket_key)
+            self._recompute_bucket(bucket_key)
+            if self._bucket_signature(bucket_key) != before:
+                changed_buckets.append(bucket_key)
+        changed_buckets.sort()
+
+        # Adjudicate the alert events (points carrying an event_id) against the
+        # recomputed state. Only these points can yield notifications; plain
+        # metric corrections without an event_id only move the aggregates.
+        # Each distinct event_id surfaces at most once across requests: a
+        # repeated active event neither re-notifies nor flips a prior verdict,
+        # while an already confirmed suppression stays sticky.
+        notifications = []
+        suppressed_notifications = []
+        for point in unique_points.values():
+            event_id = point.get("event_id")
+            if event_id is None:
+                continue
+            if event_id in self._confirmed_suppressed:
+                suppressed_notifications.append(dict(point))
+                continue
+            if self._event_is_suppressed(point):
+                suppressed_notifications.append(dict(point))
+                # A confirmed suppression is sticky: neither a replay nor a
+                # re-submission of the same event can lift it.
+                self._confirmed_suppressed.add(event_id)
+                continue
+            if event_id in self._notified_events:
+                # The event already produced an active notification: an
+                # identical resubmission never raises a second one.
+                continue
+            notifications.append(dict(point))
+            self._notified_events.add(event_id)
+        notifications.sort(key=lambda p: (p["timestamp_ms"], p["event_id"]))
+        suppressed_notifications.sort(
+            key=lambda p: (p["timestamp_ms"], p["event_id"])
+        )
+
+        result = {
+            "request_id": request_id,
+            "accepted_points": accepted_points,
+            "duplicate_points": duplicate_points,
+            "recomputed_buckets": len(changed_buckets),
+            "notifications": notifications,
+            "suppressed_notifications": suppressed_notifications,
+            "affected_ranges": self._build_affected_ranges(changed_buckets),
+        }
+        self._recomputes[request_id] = {
+            "fingerprint": self._recompute_fingerprint(request_id, raw_points),
+            "result": result,
+        }
+        return copy.deepcopy(result)

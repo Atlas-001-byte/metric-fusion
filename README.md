@@ -327,6 +327,48 @@ python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-m
 - `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；`POST /v1/metric_batches/{batch_id}/retract`：撤回批次（请求体可空，若有则须为可识别 JSON）。错误响应为 `{"code": ..., "message": ...}`，状态码如上。
 - `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。`GET /v1/suppression_audit`：返回当前已裁决告警的抑制审计（只读）。
 
+## 迟到指标确定性重算（独立公开入口）
+
+`MetricBatchService.recompute(request)`（HTTP：`POST /v1/recompute`）处理采样时间所属降采样窗口已经结束后才抵达的指标样本。在线批次写入、既有查询结构与正常及时样本的归并语义保持不变；迟到样本沿用同一来源标识、指标名、规范标签集合与指标时间戳参与归并，不会被当作新的指标序列。
+
+请求形如：
+
+```json
+{
+  "request_id": "recompute-001",
+  "points": [
+    {"source": "agent-a", "name": "cpu.usage", "labels": {"host": "db-1"},
+     "timestamp_ms": 50000, "value": 0.9},
+    {"source": "agent-a", "name": "cpu.usage", "labels": {"host": "db-1"},
+     "timestamp_ms": 50500, "value": 0.95, "event_id": "evt-7"}
+  ]
+}
+```
+
+- 每个点包含 `source`、`name`、`labels`、`timestamp_ms`、`value` 与可选原始事件标识 `event_id`（非空字符串）。带 `event_id` 的点同时作为告警事件按重算后的状态参与通知裁决；不带 `event_id` 的点只修正归并值。
+- 重算只触及每个采样时间戳所属的既有降采样窗口（桶起点仍为 `timestamp_ms // downsample_ms * downsample_ms`）以及由该窗口参与决定的上层归并结果，不改动其他窗口；同一窗口内先后到达的多个不同时间点全部保留并重新聚合。后续 `query_series` 读取修正后的窗口值、窗口时间与来源贡献情况。
+- 迟到点采用高于在线批次的可比较秩 `(1, 采样时间, request_id)`（在线批次为 `(0, max_event_time_ms, batch_id)`，高者胜），因此迟到修正覆盖在线样本，且在线批次的撤回不会移除迟到修正；在线写入与实时查询的既有语义不变。
+- 同一批内相同 `source/name/规范 labels/timestamp_ms` 的点视为重复：首次出现计入 `accepted_points`，后续完全相同者计入 `duplicate_points`。同一身份（相同来源、指标名、采样时间）携带不同标签集合，或同一规范点携带不同数值，返回 400 `conflicting_duplicate`；两种出现顺序都整批拒绝，且两种顺序结果一致。
+- 跨请求重提同一迟到身份时，沿用既有去重身份：携带与已确立修正**不同数值或不同标签**属于冲突，返回确定的 400 `conflicting_duplicate`，整批不写入、不改写已经成立的窗口结果；携带完全相同的数值与标签则不重复计数为新点，窗口保持不变。
+- 幂等：相同 `request_id` 与相同内容（与点顺序无关）重复提交时返回首次的原始结果，不修改任何指标、降采样结果或通知，即使这些点此刻已超出保留范围或落入“未来”；相同 `request_id` 携带不同内容返回 HTTP 409、`error` 为 `recompute_conflict`。
+- 多个窗口可以按任意到达顺序接受，最终结果只由已接受样本与当前聚合配置决定；无新输入时同一批查询返回一致的修正值。
+- 告警：窗口此前触发过告警时，重算完成后按现有告警判断与抑制规则（时间窗抑制规则、计划维护窗口）重新评估——仍应抑制时结果保持抑制，不再满足告警条件时不重复产生告警，重新满足且未被抑制时产生新的告警状态。同一 `event_id` 至多产生一次活跃通知，重复提交不重复计数、不重复产生告警；已确认的抑制按 `event_id` 记忆并保持粘性，即使抑制配置随后解除。已记录的时间窗抑制剧集只随在线事件推进，迟到点不回灌、不改写历史。
+- 成功响应返回 `request_id`、`accepted_points`、`duplicate_points`、`recomputed_buckets`（窗口胜者样本集实际变化的窗口数）、`notifications`、`suppressed_notifications`（各含该点完整字段，按 `(timestamp_ms, event_id)` 排序）与 `affected_ranges`（相邻变化窗口按同名同标签合并为 `{name, labels, start_ms, end_ms}` 区间）。
+- 时间边界：构造服务时可传 `retention_ms`（正整数毫秒，缺省不设下限）与 `clock_ms`（固定数值或零参数可调用对象，缺省取墙钟时间；仅用于本入口的时间判定，不影响在线写入），HTTP 服务可用 `--retention-ms` 配置。两个边界均为包含关系。
+- 校验均为整批拒绝，不写入指标、不派生降采样结果、不产生通知：
+
+  | 情况 | HTTP | `error` |
+  | --- | --- | --- |
+  | 请求体/`request_id`/`source`/`name`/`timestamp_ms` 缺失或无法解析，或服务未配置 `downsample_ms` 却提交了点 | 400 | `invalid_recompute_request` |
+  | `value` 不是有限数（NaN/无穷/非数值/布尔） | 400 | `invalid_value` |
+  | `labels` 缺失或不是合法映射 | 400 | `invalid_tags` |
+  | 采样时间晚于当前接收时间 | 400 | `future_timestamp` |
+  | 采样时间早于已有保留范围（`now - retention_ms` 之前） | 404 | `outside_retention` |
+  | 同一去重身份冲突地给出不同数值或标签（批内或跨请求） | 400 | `conflicting_duplicate` |
+  | 相同 `request_id` 携带不同内容 | 409 | `recompute_conflict` |
+
+- 时间戳缺失/无法解析（400）与超出保留范围（404）都不修改聚合结果或告警状态。错误响应统一为 `{"status": <状态码>, "error": <错误码>, "request_id": <请求标识或 null>}`；其他已有入口（`/v1/metric_batches`、撤回、`/process`、`/v1/query`、`GET` 查询、规则与维护窗口配置）的输入输出结构、错误形状 `{"code", "message"}`、归并/降采样算法、标签匹配、来源优先级、告警抑制条件、数据保留期限与配置格式均不改变。
+
 ## 约定
 
 - 公开行为以 README 与源码为准。
