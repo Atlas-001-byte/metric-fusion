@@ -107,6 +107,23 @@ python -m metric_fusion request.json > result.json
 - `GET /v1/series`、`GET /v1/alerts` 与告警抑制不读取该配置。
 - 校验：`downsample_overrides` 必须是精确指标名到正整数的映射，键非空，值不能为布尔值、零、负数、浮点数或非有限数。非法时库调用抛 `ValueError("invalid downsample_override")`，`POST /process` 与 `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid downsample_override"}`，CLI 输出 `invalid downsample_override` 并以 2 退出。校验失败不产生部分配置或部分结果。
 
+## 来源异常值过滤（可选）
+
+`process`、`POST /process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `source_outliers` 映射：键为精确指标名，值只能是含 `min_sources` 与 `tolerance` 两个字段的对象，用于在窗口归并前剔除整组孤立读数，防止单个来源的异常读数污染窗口。未提供、为 `None` 或指标名未命中映射时，行为与基线完全一致。
+
+```json
+"source_outliers": {
+  "cpu.usage": {"min_sources": 3, "tolerance": 2.0}
+}
+```
+
+- 指标仍按 `source/name/labels/timestamp_ms` 后覆盖先去重，并按 `timestamp_ms` 整除周期（`downsample_ms` 或该指标的 `downsample_overrides` 周期）划分 `name` + 规范 labels 的窗口。
+- 每个来源以其窗口内全部去重值的**均值**为代表值；再取各来源代表值的**中位数**（来源数为偶数时取排序后中间两值的算术平均）。当窗口来源数达到 `min_sources` 后，代表值与中位数之差**严格大于** `tolerance` 的来源整组剔除（该来源在该窗口的全部样本均不参与后续计算）；差值恰好等于 `tolerance` 的来源保留。来源数不足 `min_sources` 时全部保留，不过滤。
+- 过滤在聚合（`aggregations`）、`source_weights`、`source_priority`、`source_quorum` 与 `gap_fill` 之前执行：`count` 只计保留下来的去重样本，`sources` 只列保留来源；`source_quorum` 按过滤后的来源覆盖判断，过滤后未达阈值的窗口不输出，也不会被补点恢复。输出字段、`round(value, 6)`、`-0.0` 归一与 name、规范 labels、timestamp_ms 排序不变。
+- 有状态服务在补丁、迟到修正或批次撤回后重新查询时，从当前胜者样本重新过滤；批次顺序、批次秩、幂等、`affected_streams` 与 `recomputed_windows` 不受影响。
+- 仅影响 series 查询：`GET /v1/series`、`GET /v1/alerts` 与告警抑制（含解释、时间窗规则、维护窗口、审计）不读取该配置；批次应用/撤回请求也不读取它。
+- 校验：`source_outliers` 必须是字符串到对象的映射，键非空；对象只能含 `min_sources` 与 `tolerance` 两个字段；`min_sources` 必须是非布尔整数且至少为 2；`tolerance` 必须是有限的非布尔数值且不小于 0。非法时库调用抛 `ValueError("invalid source_outliers")`，`POST /process` 与 `POST /v1/query` 返回 400 与 `{"code": "invalid_request", "message": "invalid source_outliers"}`，CLI 输出 `invalid source_outliers` 并以 2 退出。校验为全有或全无，失败时不产生部分效果。
+
 ## 窗口缺口补点（可选）
 
 `process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `gap_fill` 映射：键为精确指标名，值为正整数 `max_gap_ms`。去重、窗口边界、聚合、来源权重、优先级与 `source_quorum` 全部执行完后，再在同一规范化序列（`name` + 规范 labels）的相邻**已输出**窗口之间补点，让稀疏序列有可预测的时间轴。未提供 `gap_fill` 时行为与基线完全一致。

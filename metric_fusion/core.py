@@ -264,6 +264,38 @@ def _validate_source_priority(raw: Any) -> dict:
     return validated
 
 
+def _validate_source_outliers(raw: Any) -> dict:
+    """Validate a ``source_outliers`` mapping of metric name to outlier policy.
+
+    Returns ``{}`` for an absent/None mapping (no source is ever filtered).
+    Each target maps to an object carrying at most two fields: ``min_sources``
+    (a non-boolean integer >= 2) and ``tolerance`` (a finite non-boolean
+    number >= 0). Anything invalid raises
+    ``ValueError("invalid source_outliers")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid source_outliers")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid source_outliers")
+        if not isinstance(value, dict):
+            raise ValueError("invalid source_outliers")
+        unknown = set(value) - {"min_sources", "tolerance"}
+        if unknown:
+            raise ValueError("invalid source_outliers")
+        min_sources = value.get("min_sources")
+        if not (_is_int(min_sources) and min_sources >= 2):
+            raise ValueError("invalid source_outliers")
+        tolerance = value.get("tolerance")
+        if not (_is_number(tolerance) and math.isfinite(tolerance) and tolerance >= 0):
+            raise ValueError("invalid source_outliers")
+        validated[key] = {"min_sources": min_sources, "tolerance": tolerance}
+    return validated
+
+
 def _new_bucket() -> dict:
     return {
         "sum": 0.0,
@@ -447,6 +479,60 @@ def _priority_row(
     }
 
 
+def _filter_outlier_sources(bucket: dict, policy: dict) -> dict:
+    """Drop whole sources whose window representative is an outlier.
+
+    Each source is represented by the mean of its deduplicated window values;
+    the reference is the median of those representatives (the middle pair is
+    averaged for an even source count). Once the window carries at least
+    ``min_sources`` sources, every source whose representative differs from
+    the median by strictly more than ``tolerance`` is removed together with
+    all of its samples; an exactly-equal difference is kept. With fewer
+    sources nothing is filtered. Returns either the original bucket or a new
+    bucket rebuilt from the surviving sources.
+    """
+    per_source = bucket["per_source"]
+    if len(per_source) < policy["min_sources"]:
+        return bucket
+    representatives = {source: stats[0] / stats[1] for source, stats in per_source.items()}
+    center = _median(list(representatives.values()))
+    tolerance = policy["tolerance"]
+    kept = {
+        source
+        for source, representative in representatives.items()
+        if abs(representative - center) <= tolerance
+    }
+    if len(kept) == len(per_source):
+        return bucket
+
+    filtered = _new_bucket()
+    for source, stats in per_source.items():
+        if source not in kept:
+            continue
+        filtered["per_source"][source] = [
+            stats[0],
+            stats[1],
+            stats[2],
+            stats[3],
+            stats[4],
+            list(stats[5]),
+        ]
+        filtered["sum"] += stats[0]
+        filtered["count"] += stats[1]
+        filtered["sources"].add(source)
+        filtered["values"].extend(stats[5])
+        if filtered["min"] is None or stats[2] < filtered["min"]:
+            filtered["min"] = stats[2]
+        if filtered["max"] is None or stats[3] > filtered["max"]:
+            filtered["max"] = stats[3]
+        last = filtered["last"]
+        source_last = stats[4]
+        # Same tie-break as _bucket_add: greatest timestamp, then greatest source.
+        if last is None or (source_last[0], source) > (last[0], last[1]):
+            filtered["last"] = (source_last[0], source, source_last[1])
+    return filtered
+
+
 def _fill_series_gaps(
     series: list,
     downsample_ms: int,
@@ -514,6 +600,7 @@ def _downsample(
     source_priority: dict | None = None,
     gap_fill: dict | None = None,
     downsample_overrides: dict | None = None,
+    source_outliers: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -548,9 +635,22 @@ def _downsample(
     quorum_blocked: set = set()
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
         bucket = buckets[(name, labels_key, start)]
-        # The quorum threshold is judged against the full deduplicated source
-        # set of the window — never the sample or request count. Windows below
-        # the threshold are dropped entirely: no fill points or partial rows.
+        # Per-source outlier removal runs before every other window-level
+        # option: the surviving samples alone feed aggregation, weights,
+        # priority, the quorum check and gap filling. Windows with fewer than
+        # the policy's min_sources sources are left untouched.
+        if source_outliers and name in source_outliers:
+            bucket = _filter_outlier_sources(bucket, source_outliers[name])
+            if bucket["count"] == 0:
+                # Every source was an outlier: the window has no retained
+                # sample, so it has no defined value and is dropped exactly
+                # like an under-quorum window (never resurrected by fills).
+                quorum_blocked.add((name, labels_key, start))
+                continue
+        # The quorum threshold is judged against the filtered deduplicated
+        # source set of the window — never the sample or request count. Windows
+        # below the threshold are dropped entirely: no fill points or partial
+        # rows.
         if source_quorum and name in source_quorum and len(bucket["sources"]) < source_quorum[name]:
             quorum_blocked.add((name, labels_key, start))
             continue
@@ -1466,6 +1566,11 @@ def process(
     # configuration leaves nothing partially applied.
     downsample_overrides = _validate_downsample_overrides(request.get("downsample_overrides"))
 
+    # Optional per-metric source outlier policies; validated up front (all or
+    # nothing) like every other per-metric query option. Filtering only affects
+    # series windows and runs before quorum/aggregation/weights/priority.
+    source_outliers = _validate_source_outliers(request.get("source_outliers"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1520,6 +1625,7 @@ def process(
         source_priority,
         gap_fill,
         downsample_overrides,
+        source_outliers,
     )
 
     window_suppressed_ids: set = set()
@@ -2005,6 +2111,7 @@ class MetricBatchService:
         source_priority: dict | None = None,
         gap_fill: dict | None = None,
         downsample_overrides: dict | None = None,
+        source_outliers: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -2043,8 +2150,14 @@ class MetricBatchService:
         period; different metrics never align to a common grid. Batch
         application and retraction keep using the service ``downsample_ms``
         for ranges, ranks and affected-window accounting regardless of this
-        mapping. Output rows keep the existing fields and the existing
-        (name, labels, timestamp) order.
+        mapping. ``source_outliers`` maps exact metric names to
+        ``{"min_sources": >=2, "tolerance": >=0}`` policies: before any of the
+        above a listed window with enough sources represents each source by
+        the mean of its deduplicated samples, takes the median of those
+        representatives, and drops every source whose representative differs
+        from that median by strictly more than ``tolerance``; windows below
+        ``min_sources`` keep every source. Output rows keep the existing
+        fields and the existing (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
             raise ValueError("invalid name")
@@ -2061,6 +2174,7 @@ class MetricBatchService:
             raise ValueError("invalid source_priority")
         gap_fill_map = _validate_gap_fill(gap_fill)
         override_map = _validate_downsample_overrides(downsample_overrides)
+        outliers_map = _validate_source_outliers(source_outliers)
 
         if override_map:
             # Metrics with an override are re-windowed from the current
@@ -2104,7 +2218,17 @@ class MetricBatchService:
                 continue
             if end_ms is not None and start > end_ms:
                 continue
-            # Coverage is the size of the full deduplicated winning-sample
+            # Outlier filtering runs before every other window-level option
+            # and is recomputed from the current winning samples after every
+            # patch or retraction.
+            if bucket_name in outliers_map:
+                bucket = _filter_outlier_sources(bucket, outliers_map[bucket_name])
+                if bucket["count"] == 0:
+                    # Every source was an outlier: drop the window like an
+                    # under-quorum one and never resurrect it with a fill row.
+                    quorum_blocked.add((bucket_name, labels_key, start))
+                    continue
+            # Coverage is the size of the filtered deduplicated winning-sample
             # source set, recomputed from current winners after every patch or
             # retraction — not the sample or request count.
             if (
