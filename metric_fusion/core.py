@@ -292,6 +292,28 @@ def _validate_source_priority(raw: Any) -> dict:
     return validated
 
 
+def _validate_source_freshness(raw: Any) -> dict:
+    """Validate a ``source_lag_tolerance_ms`` mapping of metric name to tolerance.
+
+    Returns ``{}`` for an absent/None mapping (no freshness filtering). Keys
+    must be non-empty strings and values non-negative integers — booleans,
+    negatives and floats are rejected. Anything invalid raises
+    ``ValueError("invalid source_freshness")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid source_freshness")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid source_freshness")
+        if not (_is_int(value) and value >= 0):
+            raise ValueError("invalid source_freshness")
+        validated[key] = value
+    return validated
+
+
 def _new_bucket() -> dict:
     return {
         "sum": 0.0,
@@ -357,6 +379,28 @@ def _nearest_rank(values: list, quantile: float) -> float:
     return ordered[rank - 1]
 
 
+def _subset_bucket(bucket: dict, kept: list) -> dict:
+    """Rebuild a bucket from only the ``kept`` sources' per-source statistics."""
+    filtered = _new_bucket()
+    for source in sorted(kept):
+        stats = bucket["per_source"][source]
+        filtered["sum"] += stats[0]
+        filtered["count"] += stats[1]
+        filtered["sources"].add(source)
+        filtered["values"].extend(stats[5])
+        filtered["per_source"][source] = stats
+        if filtered["min"] is None or stats[2] < filtered["min"]:
+            filtered["min"] = stats[2]
+        if filtered["max"] is None or stats[3] > filtered["max"]:
+            filtered["max"] = stats[3]
+        last = filtered["last"]
+        # Same tie rule as _bucket_add: greatest timestamp, then the
+        # lexicographically greatest source.
+        if last is None or (stats[4][0], source) > (last[0], last[1]):
+            filtered["last"] = (stats[4][0], source, stats[4][1])
+    return filtered
+
+
 def _filter_source_outliers(bucket: dict, min_sources: int, tolerance: Any) -> dict:
     """Return the bucket with outlier source groups removed (never mutates).
 
@@ -383,24 +427,31 @@ def _filter_source_outliers(bucket: dict, min_sources: int, tolerance: Any) -> d
     ]
     if len(kept) == len(sources):
         return bucket
-    filtered = _new_bucket()
-    for source in sorted(kept):
-        stats = bucket["per_source"][source]
-        filtered["sum"] += stats[0]
-        filtered["count"] += stats[1]
-        filtered["sources"].add(source)
-        filtered["values"].extend(stats[5])
-        filtered["per_source"][source] = stats
-        if filtered["min"] is None or stats[2] < filtered["min"]:
-            filtered["min"] = stats[2]
-        if filtered["max"] is None or stats[3] > filtered["max"]:
-            filtered["max"] = stats[3]
-        last = filtered["last"]
-        # Same tie rule as _bucket_add: greatest timestamp, then the
-        # lexicographically greatest source.
-        if last is None or (stats[4][0], source) > (last[0], last[1]):
-            filtered["last"] = (stats[4][0], source, stats[4][1])
-    return filtered
+    return _subset_bucket(bucket, kept)
+
+
+def _filter_source_freshness(bucket: dict, tolerance_ms: int) -> dict:
+    """Return the bucket with stale source groups removed (never mutates).
+
+    Each source's anchor is the greatest timestamp_ms of its deduplicated
+    window samples; the window anchor is the largest source anchor. A source
+    whose anchor lags the window anchor by strictly more than ``tolerance_ms``
+    is dropped as a whole — a lag exactly equal to the tolerance is kept. The
+    source carrying the window anchor always survives, so this filter never
+    empties a bucket. When nothing is filtered the original bucket is
+    returned unchanged.
+    """
+    sources = bucket["sources"]
+    anchors = {source: bucket["per_source"][source][4][0] for source in sources}
+    window_anchor = max(anchors.values())
+    kept = [
+        source
+        for source in sources
+        if window_anchor - anchors[source] <= tolerance_ms
+    ]
+    if len(kept) == len(sources):
+        return bucket
+    return _subset_bucket(bucket, kept)
 
 
 def _bucket_value(bucket: dict, func: str) -> float:
@@ -589,6 +640,7 @@ def _downsample(
     gap_fill: dict | None = None,
     downsample_overrides: dict | None = None,
     source_outliers: dict | None = None,
+    source_freshness: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -623,6 +675,12 @@ def _downsample(
     quorum_blocked: set = set()
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
         bucket = buckets[(name, labels_key, start)]
+        # Source-freshness filtering runs on the deduplicated window before
+        # outlier filtering, aggregation, weighting, failover, quorum and gap
+        # filling; only the surviving sources feed every later step.
+        freshness = source_freshness.get(name) if source_freshness else None
+        if freshness is not None:
+            bucket = _filter_source_freshness(bucket, freshness)
         # Source-outlier filtering runs on the deduplicated window before any
         # aggregation, weighting, failover or quorum decision; a window whose
         # samples are all filtered out produces no row at all.
@@ -1556,6 +1614,11 @@ def process(
     # configuration. Metrics absent from the mapping are unaffected.
     source_outliers = _validate_source_outliers(request.get("source_outliers"))
 
+    # Optional per-metric source-freshness tolerances; validated up front (all
+    # or nothing) like every other optional query configuration. Metrics
+    # absent from the mapping are unaffected.
+    source_freshness = _validate_source_freshness(request.get("source_lag_tolerance_ms"))
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1611,6 +1674,7 @@ def process(
         gap_fill,
         downsample_overrides,
         source_outliers,
+        source_freshness,
     )
 
     window_suppressed_ids: set = set()
@@ -2235,6 +2299,7 @@ class MetricBatchService:
         gap_fill: dict | None = None,
         downsample_overrides: dict | None = None,
         source_outliers: dict | None = None,
+        source_lag_tolerance_ms: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -2283,7 +2348,15 @@ class MetricBatchService:
         failover, quorum and gap filling are applied — so patches, late
         corrections and retractions are re-filtered from the current winning
         samples on every query. Metrics absent from the mapping are
-        unaffected. Output rows keep the existing fields and the existing
+        unaffected. ``source_lag_tolerance_ms`` maps exact metric names to
+        non-negative integer millisecond tolerances: within each window of a
+        listed metric, every source is anchored at the greatest timestamp_ms
+        of its deduplicated winning samples, and any source whose anchor lags
+        the window's greatest anchor by strictly more than the tolerance is
+        dropped as a whole before outlier filtering, aggregation, weighting,
+        failover, quorum and gap filling are applied — a lag exactly equal to
+        the tolerance is kept. Metrics absent from the mapping are unaffected.
+        Output rows keep the existing fields and the existing
         (name, labels, timestamp) order.
         """
         if name is not None and not isinstance(name, str):
@@ -2302,6 +2375,7 @@ class MetricBatchService:
         gap_fill_map = _validate_gap_fill(gap_fill)
         override_map = _validate_downsample_overrides(downsample_overrides)
         outliers_map = _validate_source_outliers(source_outliers)
+        freshness_map = _validate_source_freshness(source_lag_tolerance_ms)
 
         if override_map:
             # Metrics with an override are re-windowed from the current
@@ -2345,6 +2419,13 @@ class MetricBatchService:
                 continue
             if end_ms is not None and start > end_ms:
                 continue
+            # Source-freshness filtering runs on the window's current winning
+            # samples before outlier filtering, coverage, aggregation,
+            # weighting or failover; only the surviving sources feed later
+            # steps. The window anchor's own source always survives.
+            freshness = freshness_map.get(bucket_name)
+            if freshness is not None:
+                bucket = _filter_source_freshness(bucket, freshness)
             # Source-outlier filtering runs on the window's current winning
             # samples before coverage, aggregation, weighting or failover;
             # a window whose samples are all filtered out produces no row.
