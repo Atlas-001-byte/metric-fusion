@@ -13,6 +13,15 @@ SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
 
 AGGREGATION_FUNCTIONS = ("avg", "min", "max", "sum", "last", "median", "p95", "p99")
 
+# Suppression-audit cause kinds. The baseline time rule carries no rule id;
+# the other three kinds cite the hit rule/window. The fixed output ordering
+# (time, suppression_rule, window_rule, maintenance) is encoded directly in
+# _suppression_causes.
+_AUDIT_KIND_TIME = "time"
+_AUDIT_KIND_SUPPRESSION_RULE = "suppression_rule"
+_AUDIT_KIND_WINDOW_RULE = "window_rule"
+_AUDIT_KIND_MAINTENANCE = "maintenance"
+
 _ALERT_FIELDS = ("source", "name", "labels", "alert_id", "rule", "timestamp_ms", "severity")
 
 
@@ -581,7 +590,7 @@ def _downsample(
     return series
 
 
-def _suppress_alerts(alerts: list, suppression_ms: int) -> tuple[list, list]:
+def _suppress_alerts(alerts: list, suppression_ms: int) -> tuple[list, list, set]:
     groups: dict = {}
     for alert in alerts:
         key = (alert["rule"], alert["name"], _canonical_labels(alert["labels"]))
@@ -615,7 +624,13 @@ def _suppress_alerts(alerts: list, suppression_ms: int) -> tuple[list, list]:
         }
         for alert in alerts
     ]
-    return result_alerts, [a["alert_id"] for a in result_alerts if a["suppressed"]]
+    return (
+        result_alerts,
+        [a["alert_id"] for a in result_alerts if a["suppressed"]],
+        # The set of ids suppressed by the baseline time rule itself; callers
+        # that merge further suppression kinds need the exact membership.
+        set(suppressed_ids),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +861,10 @@ def _process_with_explanations(
     output_alerts = []
     explanations = []
     suppressed_alert_ids: list = []
+    # Maps every alert id suppressed by a configured suppression rule to the
+    # selected rule's id; the suppression audit uses this as the
+    # ``suppression_rule`` causes.
+    rule_suppressed: dict = {}
 
     # Output keeps the original alert fields and input order.
     for index, alert in enumerate(alerts):
@@ -858,6 +877,7 @@ def _process_with_explanations(
             started_at, suppressor_index, rule = suppression
             output_alert["status"] = "suppressed"
             suppressed_alert_ids.append(alert["alert_id"])
+            rule_suppressed[alert["alert_id"]] = rule["rule_id"]
             explanations.append(
                 {
                     "suppressed_fingerprint": fingerprints[index],
@@ -877,6 +897,7 @@ def _process_with_explanations(
         "alerts": output_alerts,
         "suppressed_alert_ids": suppressed_alert_ids,
         "explanations": explanations,
+        "rule_suppressed": rule_suppressed,
     }
 
 
@@ -1085,6 +1106,32 @@ class WindowSuppressionEngine:
 
     # -- suppression decisions --------------------------------------------------
 
+    def suppressing_rule_ids(self, source: str, name: str, labels: dict, timestamp_ms: Any) -> set:
+        """Ids of window rules whose active suppression window covers an alert.
+
+        A rule counts when its recorded episode is still inside the
+        suppression interval (not merely in recovery observation) at
+        ``timestamp_ms``.
+        """
+        if not (
+            isinstance(source, str)
+            and isinstance(name, str)
+            and isinstance(labels, dict)
+            and _valid_timestamp(timestamp_ms)
+        ):
+            return set()
+        labels_key = _canonical_labels(labels)
+        rule_ids: set = set()
+        for rule in self._matching_rules(source, name, labels):
+            state = self._states.get((rule["rule_id"], source, labels_key))
+            if state is None or state.suppression_end is None:
+                continue
+            if not (state.suppression_start <= timestamp_ms <= state.recovery_deadline):
+                continue
+            if timestamp_ms <= state.suppression_end:
+                rule_ids.add(rule["rule_id"])
+        return rule_ids
+
     def is_suppressed(self, source: str, name: str, labels: dict, timestamp_ms: Any) -> bool:
         """Whether an alert emitted at ``timestamp_ms`` is suppressed.
 
@@ -1192,10 +1239,11 @@ def reset_window_suppressions() -> None:
     _default_window_engine.reset()
 
 
-def _feed_window_events(engine: WindowSuppressionEngine, metrics: list, alerts: list) -> set:
+def _feed_window_events(engine: WindowSuppressionEngine, metrics: list, alerts: list) -> tuple[set, dict]:
     """Drive the engine with one batch of events in event-time order.
 
-    Returns the ids of alerts suppressed by a window rule. An alert is
+    Returns the ids of alerts suppressed by a window rule together with a
+    mapping of each suppressed alert id to the hit rule_id set. An alert is
     evaluated against the state right before its own event is recorded, so
     the observation that triggers a suppression is still emitted and only
     later observations are suppressed.
@@ -1207,13 +1255,23 @@ def _feed_window_events(engine: WindowSuppressionEngine, metrics: list, alerts: 
     ]
     events.sort(key=lambda event: (event[0], event[1]))
     suppressed_ids: set = set()
+    rule_hits: dict = {}
     for timestamp_ms, _index, event, alert_id in events:
-        if alert_id is not None and engine.is_suppressed(
-            event["source"], event["name"], event["labels"], timestamp_ms
-        ):
-            suppressed_ids.add(alert_id)
+        if alert_id is not None:
+            # Causes follow the final aggregate window decision (the
+            # earliest-ending governing window); while that decision is
+            # negative — e.g. the governing rule is already in recovery even
+            # though another rule's window still runs — no window cause is
+            # recorded at all.
+            if engine.is_suppressed(
+                event["source"], event["name"], event["labels"], timestamp_ms
+            ):
+                suppressed_ids.add(alert_id)
+                rule_hits[alert_id] = engine.suppressing_rule_ids(
+                    event["source"], event["name"], event["labels"], timestamp_ms
+                )
         engine.record_event(event)
-    return suppressed_ids
+    return suppressed_ids, rule_hits
 
 
 # ---------------------------------------------------------------------------
@@ -1295,15 +1353,98 @@ def _maintenance_window_matches(window: dict, alert: dict) -> bool:
     return True
 
 
-def _maintenance_suppressed_ids(alerts: list, windows: list) -> set:
-    """Ids of alerts falling inside at least one maintenance window."""
-    if not windows:
-        return set()
-    return {
-        alert["alert_id"]
-        for alert in alerts
-        if any(_maintenance_window_matches(window, alert) for window in windows)
-    }
+def _maintenance_hits(alerts: list, windows: list) -> dict:
+    """Map each alert id to the window ids that match it."""
+    hits: dict = {}
+    for alert in alerts:
+        window_ids = {
+            window["window_id"] for window in windows if _maintenance_window_matches(window, alert)
+        }
+        if window_ids:
+            hits[alert["alert_id"]] = window_ids
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Suppression audit
+# ---------------------------------------------------------------------------
+
+
+def _suppression_causes(
+    alert_id: str,
+    *,
+    time_ids: set,
+    rule_hits: dict,
+    window_hits: dict,
+    maintenance_hits: dict,
+) -> list:
+    """Sorted, de-duplicated audit causes for one adjudicated alert.
+
+    Causes are ordered by the fixed kind order (time, suppression_rule,
+    window_rule, maintenance) and lexicographically by id within a kind. The
+    baseline time cause has a null id; every other kind cites the hit
+    rule_id/window_id.
+    """
+    causes: list = []
+    if alert_id in time_ids:
+        causes.append({"kind": _AUDIT_KIND_TIME, "id": None})
+    # Rule adjudication selects at most one rule per alert, so rule_hits maps
+    # an alert id to a single rule_id string; window/maintenance hits map to
+    # id sets. Normalize the scalar to a collection before iterating.
+    rule_ids = rule_hits.get(alert_id)
+    if isinstance(rule_ids, str):
+        rule_ids = (rule_ids,)
+    if rule_ids:
+        for cause_id in sorted(rule_ids):
+            causes.append({"kind": _AUDIT_KIND_SUPPRESSION_RULE, "id": cause_id})
+    for kind, hits in (
+        (_AUDIT_KIND_WINDOW_RULE, window_hits),
+        (_AUDIT_KIND_MAINTENANCE, maintenance_hits),
+    ):
+        for cause_id in sorted(hits.get(alert_id, ())):
+            causes.append({"kind": kind, "id": cause_id})
+    return causes
+
+
+def _build_suppression_audit(
+    alerts: list,
+    suppressed_ids,
+    *,
+    time_ids: set | None = None,
+    rule_hits: dict | None = None,
+    window_hits: dict | None = None,
+    maintenance_hits: dict | None = None,
+) -> list:
+    """Build one audit record per adjudicated alert in adjudication order.
+
+    ``suppressed_ids`` is the final (union) suppression decision; the four
+    cause mappings explain that decision. Every adjudicated alert gets
+    exactly one record and unsuppressed alerts carry an empty causes array.
+    """
+    time_ids = time_ids or set()
+    rule_hits = rule_hits or {}
+    window_hits = window_hits or {}
+    maintenance_hits = maintenance_hits or {}
+    suppressed_set = set(suppressed_ids)
+    audit = []
+    for alert in alerts:
+        alert_id = alert["alert_id"]
+        is_suppressed = alert_id in suppressed_set
+        causes = (
+            _suppression_causes(
+                alert_id,
+                time_ids=time_ids,
+                rule_hits=rule_hits,
+                window_hits=window_hits,
+                maintenance_hits=maintenance_hits,
+            )
+            if is_suppressed
+            else []
+        )
+        audit.append(
+            {"alert_id": alert_id, "suppressed": is_suppressed, "causes": causes}
+        )
+    return audit
 
 
 def process(
@@ -1358,6 +1499,15 @@ def process(
     if not isinstance(enabled_raw, bool):
         raise ValueError("invalid enable_explanations")
     enabled = enabled_raw
+
+    # The suppression audit is opt-in and only accepts a real boolean; the
+    # flag is validated up front like every other option so a failure never
+    # produces a partial audit (or any other partial result).
+    include_audit_raw = request.get("include_suppression_audit", False)
+    if not isinstance(include_audit_raw, bool):
+        raise ValueError("invalid suppression audit")
+    include_audit = include_audit_raw
+
     rules: list = []
     if enabled:
         raw_rules = request.get("suppression_rules", [])
@@ -1401,16 +1551,20 @@ def process(
     )
 
     window_suppressed_ids: set = set()
+    window_rule_hits: dict = {}
     engine: WindowSuppressionEngine | None = None
     if validated_window_rules is not None:
         engine = _default_window_engine if window_engine is None else window_engine
         engine.set_rules(validated_window_rules)
-        window_suppressed_ids = _feed_window_events(engine, metrics, alerts)
+        window_suppressed_ids, window_rule_hits = _feed_window_events(engine, metrics, alerts)
 
-    maintenance_suppressed_ids = _maintenance_suppressed_ids(alerts, maintenance_windows)
+    maintenance_hits = _maintenance_hits(alerts, maintenance_windows)
+    maintenance_suppressed_ids = set(maintenance_hits)
     extra_suppressed_ids = window_suppressed_ids | maintenance_suppressed_ids
 
-    result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, suppression_ms)
+    result_alerts, suppressed_alert_ids, time_suppressed_ids = _suppress_alerts(
+        alerts, suppression_ms
+    )
     if extra_suppressed_ids:
         for entry in result_alerts:
             if entry["alert_id"] in extra_suppressed_ids:
@@ -1425,23 +1579,46 @@ def process(
         }
         if engine is not None:
             result["suppression_states"] = engine.query()
+        if include_audit:
+            # Explanation mode is off: the configured suppression rules are
+            # dormant, so the audit lists time/window/maintenance causes only.
+            result["suppression_audit"] = _build_suppression_audit(
+                alerts,
+                suppressed_alert_ids,
+                time_ids=time_suppressed_ids,
+                window_hits=window_rule_hits,
+                maintenance_hits=maintenance_hits,
+            )
         return result
 
     target_registry = _default_registry if registry is None else registry
-    result = _process_with_explanations(alerts, series, rules, target_registry)
+    adjudication = _process_with_explanations(alerts, series, rules, target_registry)
+    # Internal-only mapping of rule-suppressed alert ids to rule_ids; it must
+    # never leak into the response payload.
+    rule_hits = adjudication.pop("rule_suppressed")
     if extra_suppressed_ids:
-        for output_alert in result["alerts"]:
+        for output_alert in adjudication["alerts"]:
             if output_alert["alert_id"] in extra_suppressed_ids:
                 output_alert["status"] = "suppressed"
-        merged_ids = set(result["suppressed_alert_ids"]) | extra_suppressed_ids
-        result["suppressed_alert_ids"] = [
+        merged_ids = set(adjudication["suppressed_alert_ids"]) | extra_suppressed_ids
+        adjudication["suppressed_alert_ids"] = [
             output_alert["alert_id"]
-            for output_alert in result["alerts"]
+            for output_alert in adjudication["alerts"]
             if output_alert["alert_id"] in merged_ids
         ]
     if engine is not None:
-        result["suppression_states"] = engine.query()
-    return result
+        adjudication["suppression_states"] = engine.query()
+    if include_audit:
+        # In explanation mode the baseline suppression_ms time rule is
+        # replaced by rule adjudication; rule causes appear only here.
+        adjudication["suppression_audit"] = _build_suppression_audit(
+            alerts,
+            adjudication["suppressed_alert_ids"],
+            rule_hits=rule_hits,
+            window_hits=window_rule_hits,
+            maintenance_hits=maintenance_hits,
+        )
+    return adjudication
 
 
 # ---------------------------------------------------------------------------
@@ -2038,29 +2215,36 @@ class MetricBatchService:
         """
         self._maintenance_windows = _validate_maintenance_windows(windows)
 
-    def query_alerts(self) -> dict:
+    def _adjudicate_alerts(self) -> dict:
         """Re-adjudicate all stored alerts against the current configuration.
 
-        Suppression is recomputed on every query, so corrections that change
-        the stored alert set are reflected in subsequent results.
+        Returns the public query result plus internal ``_*`` cause mappings
+        used to build the suppression audit. Suppression is recomputed on
+        every query, so corrections that change the stored alert set are
+        reflected in subsequent results.
         """
         alerts = list(self._alerts)
-        window_suppressed_ids = {
-            alert["alert_id"]
-            for alert in alerts
+        # Window causes follow the final aggregate window decision; while the
+        # aggregate decision is positive, every rule whose suppression
+        # interval covers the alert is listed.
+        window_hits: dict = {}
+        for alert in alerts:
             if self._window_engine.is_suppressed(
                 alert["source"], alert["name"], alert["labels"], alert["timestamp_ms"]
-            )
-        }
+            ):
+                window_hits[alert["alert_id"]] = self._window_engine.suppressing_rule_ids(
+                    alert["source"], alert["name"], alert["labels"], alert["timestamp_ms"]
+                )
         # Maintenance windows are re-evaluated against the current alert set
         # on every query, so late corrections and retractions are reflected.
-        extra_suppressed_ids = window_suppressed_ids | _maintenance_suppressed_ids(
-            alerts, self._maintenance_windows
-        )
+        maintenance_hits = _maintenance_hits(alerts, self._maintenance_windows)
+        extra_suppressed_ids = set(window_hits) | set(maintenance_hits)
         if self._enable_explanations:
             result = _process_with_explanations(
                 alerts, self.query_series(), self._rules, self._registry
             )
+            rule_hits = result.pop("rule_suppressed")
+            time_ids: set = set()
             if extra_suppressed_ids:
                 for output_alert in result["alerts"]:
                     if output_alert["alert_id"] in extra_suppressed_ids:
@@ -2071,13 +2255,58 @@ class MetricBatchService:
                     for output_alert in result["alerts"]
                     if output_alert["alert_id"] in merged_ids
                 ]
-            return result
-        result_alerts, suppressed_alert_ids = _suppress_alerts(alerts, self._suppression_ms)
-        if extra_suppressed_ids:
-            for entry in result_alerts:
-                if entry["alert_id"] in extra_suppressed_ids:
-                    entry["suppressed"] = True
-            suppressed_alert_ids = [
-                entry["alert_id"] for entry in result_alerts if entry["suppressed"]
-            ]
-        return {"alerts": result_alerts, "suppressed_alert_ids": suppressed_alert_ids}
+        else:
+            result_alerts, suppressed_alert_ids, time_ids = _suppress_alerts(
+                alerts, self._suppression_ms
+            )
+            if extra_suppressed_ids:
+                for entry in result_alerts:
+                    if entry["alert_id"] in extra_suppressed_ids:
+                        entry["suppressed"] = True
+                suppressed_alert_ids = [
+                    entry["alert_id"] for entry in result_alerts if entry["suppressed"]
+                ]
+            result = {"alerts": result_alerts, "suppressed_alert_ids": suppressed_alert_ids}
+            rule_hits = {}
+        result["_audit_time_ids"] = time_ids
+        result["_audit_rule_hits"] = rule_hits
+        result["_audit_window_hits"] = window_hits
+        result["_audit_maintenance_hits"] = maintenance_hits
+        return result
+
+    def query_alerts(self) -> dict:
+        """Re-adjudicate all stored alerts against the current configuration.
+
+        Suppression is recomputed on every query, so corrections that change
+        the stored alert set are reflected in subsequent results.
+        """
+        result = self._adjudicate_alerts()
+        for internal_key in (
+            "_audit_time_ids",
+            "_audit_rule_hits",
+            "_audit_window_hits",
+            "_audit_maintenance_hits",
+        ):
+            result.pop(internal_key, None)
+        return result
+
+    def query_suppression_audit(self) -> list:
+        """Return one suppression-audit record per currently stored alert.
+
+        The audit is recomputed against the current state on every call, so
+        batch patches, late corrections and retractions are all reflected;
+        replaying a batch or retracting the same ``batch_id`` twice never
+        adds records because neither operation adds alerts. The query is
+        read-only: it never changes the alert/series results or the
+        configuration.
+        """
+        alerts = list(self._alerts)
+        adjudication = self._adjudicate_alerts()
+        return _build_suppression_audit(
+            alerts,
+            adjudication["suppressed_alert_ids"],
+            time_ids=adjudication["_audit_time_ids"],
+            rule_hits=adjudication["_audit_rule_hits"],
+            window_hits=adjudication["_audit_window_hits"],
+            maintenance_hits=adjudication["_audit_maintenance_hits"],
+        )
