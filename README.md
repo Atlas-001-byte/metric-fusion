@@ -224,6 +224,31 @@ query_window_suppressions(rule_id="cpu-flap", now_ms=60000)
 - 校验：配置或字段非法时，库调用与无状态处理抛 `ValueError("invalid maintenance_window")`；CLI 输出该消息并以 2 退出；HTTP 返回 400，`{"code": "invalid_maintenance_window", "message": "invalid maintenance_window"}`。校验为整批全有或全无，失败时已有配置保持不变，无部分效果。
 - HTTP：`PUT`/`POST /v1/maintenance_windows`，请求体为窗口数组或 `{"maintenance_windows": [...]}`，整批校验通过后一次替换，成功返回 `{"status": "ok"}`。
 
+## 抑制审计查询（可选）
+
+在 `process` / `POST /process` 请求中加 `"include_suppression_audit": true`（默认 `false`），响应新增 `suppression_audit`；有状态服务可随时用 `MetricBatchService.query_suppression_audit()` 或 `GET /v1/suppression_audit` 查询。审计只读：不改变 `GET /v1/alerts`、`GET /v1/series` 或任何配置状态。
+
+- 每条**已裁决告警恰有一条**记录，固定含 `alert_id`、`suppressed`、`causes`；记录顺序与告警一致。未抑制时 `causes` 为空数组 `[]`，且被抑制的记录必有至少一个原因。
+- `causes` 每项固定含 `kind` 与 `id`。`kind` 只能是：
+  - `time`：基线时间抑制（同组距最近发出告警不超过 `suppression_ms` 且级别未提高）；`id` 恒为 `null`。
+  - `suppression_rule`：抑制解释规则命中；`id` 为命中的 `rule_id`。**仅当 `enable_explanations` 已启用且确实产生规则抑制时记录**；解释模式下规则裁决取代基线时间抑制，因此该模式不产生 `time` 原因。
+  - `window_rule`：时间窗抑制规则命中；`id` 为命中的 `rule_id`。多规则同时命中时全部列出。
+  - `maintenance`：命中计划维护窗口；`id` 为命中的 `window_id`，多窗口全部列出。
+- 同一 `kind` 与 `id` 不重复。原因排序固定为 `time` → `suppression_rule` → `window_rule` → `maintenance`；同类内按 `id` 字典序（`time` 的 `null` 唯一）。
+- `window_rule`、`maintenance`、`time` 三类沿用最终抑制判定：只列出真正促成抑制结果的原因；`suppressed` 与最终裁决一致。窗口规则在多条覆盖时沿用“最早结束窗口”的汇总口径——最早窗口一旦过期，告警突破，其余仍开启的窗口也不再列为原因。
+- 有状态服务中，批次补丁、迟到修正与撤回后审计按当前告警集重新裁决，反映最新结果；重复应用或重复撤回同一 `batch_id` 均为幂等操作，不增加审计记录。审计查询本身不写入抑制解释记录。
+- 无状态 `process` 中，窗口原因按各告警事件记录前的快照判定（与该路径抑制裁决口径一致）；有状态服务按查询时已累积的窗口状态判定。
+- `include_suppression_audit` 只接受布尔值；字符串、`1`/`0`、`null` 等其他值由 `process` 抛 `ValueError("invalid suppression audit")`，`POST /process` 返回 400 与 `{"code": "invalid_request", "message": "invalid suppression audit"}`，CLI 输出该消息并以退出码 2 结束。校验与其他配置一样在状态变更前完成，失败不产生部分审计结果。
+- HTTP：`GET /v1/suppression_audit` 返回 `{"suppression_audit": [...]}`。
+
+```python
+service.query_suppression_audit()
+# [{"alert_id": "a2", "suppressed": True,
+#   "causes": [{"kind": "time", "id": None},
+#              {"kind": "window_rule", "id": "cpu-flap"},
+#              {"kind": "maintenance", "id": "db-patching"}]}]
+```
+
 ## 指标批次补丁与迟到修正（有状态服务）
 
 `MetricBatchService` 在内存中维护指标流状态，接受带批次标识的指标样本批次，支持幂等应用与迟到数据修正；不增加任何落盘文件或持久化入口。
@@ -284,7 +309,7 @@ python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-m
 ```
 
 - `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；`POST /v1/metric_batches/{batch_id}/retract`：撤回批次（请求体可空，若有则须为可识别 JSON）。错误响应为 `{"code": ..., "message": ...}`，状态码如上。
-- `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。
+- `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。`GET /v1/suppression_audit`：返回当前已裁决告警的抑制审计（只读）。
 
 ## 约定
 

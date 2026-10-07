@@ -25,6 +25,7 @@ RETRACT_PREFIX = "/v1/metric_batches/"
 RETRACT_SUFFIX = "/retract"
 WINDOW_RULES_PATH = "/v1/window_suppression_rules"
 WINDOW_SUPPRESSIONS_PATH = "/v1/window_suppressions"
+SUPPRESSION_AUDIT_PATH = "/v1/suppression_audit"
 MAINTENANCE_WINDOWS_PATH = "/v1/maintenance_windows"
 
 
@@ -236,6 +237,13 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             elif self.path == "/v1/alerts":
                 with lock:
                     _send_json(self, 200, service.query_alerts())
+            elif split.path == SUPPRESSION_AUDIT_PATH:
+                # Read-only: the audit is re-adjudicated like GET /v1/alerts
+                # but changes neither alerts, series nor configuration state.
+                with lock:
+                    _send_json(
+                        self, 200, {"suppression_audit": service.query_suppression_audit()}
+                    )
             elif self.path == "/v1/series":
                 with lock:
                     _send_json(self, 200, {"series": service.query_series()})
