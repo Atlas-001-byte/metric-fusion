@@ -121,6 +121,22 @@ python -m metric_fusion request.json > result.json
 - 有状态服务在补丁、迟到修正或撤回后重新查询时，按当前胜者样本与配置重算补点；排序、`round(value, 6)` 与 `-0.0` 归一语义不变。
 - 校验：`gap_fill` 必须是精确指标名到正整数的映射，键非空，值不能为布尔值、零、负数或浮点数。非法时库调用抛 `ValueError("invalid gap_fill")`，HTTP `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid gap_fill"}`，CLI 输出 `invalid gap_fill` 并以 2 退出。校验失败不部分修改状态。
 
+## 来源异常值过滤（可选）
+
+`process`、`POST /process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `source_outliers` 映射：键为精确指标名，值为 `{"min_sources": ..., "tolerance": ...}` 配置。它在多源去重、聚合、来源权重与优先级、法定人数、补点和批次修正之上过滤孤立读数，防止单个异常来源污染窗口。未提供、`None` 或指标名未命中映射时行为与基线完全一致。
+
+```json
+"source_outliers": {"cpu.usage": {"min_sources": 3, "tolerance": 10}}
+```
+
+- 指标仍按 `source/name/labels/timestamp_ms` 后覆盖先去重，并按 `timestamp_ms` 整除周期划分 `name` 加规范 labels 的窗口；过滤在每个窗口内独立进行。
+- 窗口内每个来源取其去重样本的均值作为代表值，再取所有代表值的中位数（偶数个取中间两值的平均）作为参照。
+- 窗口来源数达到 `min_sources` 后，代表值与中位数之差**严格大于** `tolerance` 的来源整组剔除；差值恰好等于 `tolerance` 的来源保留，来源数不足 `min_sources` 时全部保留。
+- 过滤后再执行聚合函数、`source_weights` 或 `source_priority`、`source_quorum` 与 `gap_fill`；`count` 只计保留样本，`sources` 只列保留来源，`source_quorum` 按过滤后的覆盖判断，未达阈值的窗口不输出也不补回。输出字段、`round(value, 6)`、`-0.0` 归一及（name、规范 labels、timestamp_ms）排序不变。
+- 仅影响 series 查询；`GET /v1/series`、`GET /v1/alerts` 与告警抑制不读取该配置，其余功能不变。
+- 有状态服务在补丁、迟到修正或撤回后重新查询时，从当前胜者样本重新过滤，批次顺序不影响结果。
+- 校验：`source_outliers` 必须是精确指标名到配置对象的映射，键非空，对象只能含 `min_sources` 与 `tolerance`；`min_sources` 为非布尔整数且至少为 2，`tolerance` 为有限非布尔数且不小于 0。非法时库调用抛 `ValueError("invalid source_outliers")`，`POST /process` 与 `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_outliers"}`，CLI 输出 `invalid source_outliers` 并以 2 退出。校验失败不产生部分效果。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。
