@@ -1693,6 +1693,14 @@ def process(
 BATCH_APPLIED = "applied"
 BATCH_RETRACTED = "retracted"
 
+# Candidate rank of a late-submitted sample inside a point's candidate map.
+# It sits below every batch rank ``(max_event_time_ms, batch_id)`` — the
+# batch_id of a real batch is a non-empty string and its max_event_time_ms is
+# never negative — so the batch patch/retraction flow can still correct a
+# late value deterministically, while the late value wins whenever no batch
+# covers the point.
+_LATE_RANK = (0, "")
+
 
 class BatchError(ValueError):
     """Structured batch-API failure carrying an HTTP status and a stable code."""
@@ -1745,7 +1753,9 @@ class MetricBatchService:
     downsample windows they touch; queries always reflect the current state.
     Point conflicts across batches resolve deterministically by batch rank
     ``(max_event_time_ms, batch_id)`` — the higher rank wins — so the final
-    aggregates do not depend on batch arrival order.
+    aggregates do not depend on batch arrival order. Individual late samples
+    (``submit_late_metrics``) recompute only the windows they touch and reject
+    identity conflicts instead of ranking them.
     """
 
     def __init__(
@@ -2081,6 +2091,134 @@ class MetricBatchService:
         if bucket is None:
             return None
         return round(bucket["sum"] / bucket["count"] + 0.0, 6)
+
+    # -- late-sample recomputation --------------------------------------------
+
+    def submit_late_metrics(self, request: Any) -> dict:
+        """Apply late-arriving metric samples and recompute the windows they touch.
+
+        ``request`` is a list of samples or a mapping with a ``"metrics"``
+        list; each sample keeps the established metric fields
+        (``source/name/labels/timestamp_ms/value``). A sample is late when it
+        reaches the service after its downsample window has already been
+        computed from earlier input. The window holding its timestamp is
+        recomputed from the current sample set, so subsequent queries read the
+        corrected window value, window time and source contributions; windows
+        the samples do not touch keep their established results.
+
+        The dedupe identity is the established
+        ``source/name/labels/timestamp_ms`` point. Re-submitting an identical
+        sample is an idempotent no-op (no double counting, no new alerts);
+        the same identity carrying a different value is a conflict, rejected
+        with a 400 ``late_metric_conflict`` error that leaves the established
+        window results untouched. A missing or unparseable timestamp is a 400
+        ``late_metric_invalid`` error; a timestamp outside the retained range
+        (the span of downsample windows holding currently stored samples) is a
+        404 ``late_metric_out_of_retention`` error. Validation is completed
+        before any state changes, so every failure is atomic and neither
+        aggregates nor alert states are modified.
+        """
+        if isinstance(request, dict):
+            raw_metrics = request.get("metrics")
+        else:
+            raw_metrics = request
+        if not isinstance(raw_metrics, list):
+            raise BatchError(400, "late_metric_invalid", "invalid request")
+        metrics = []
+        for raw in raw_metrics:
+            if not isinstance(raw, dict):
+                raise BatchError(400, "late_metric_invalid", "invalid metric")
+            # A sample whose timestamp is missing or unparseable cannot be
+            # assigned to any downsample window; it must not be dropped
+            # silently.
+            if not _valid_timestamp(raw.get("timestamp_ms")):
+                raise BatchError(400, "late_metric_invalid", "invalid timestamp")
+            try:
+                metrics.append(_validate_metric(raw))
+            except ValueError as exc:
+                raise BatchError(400, "late_metric_invalid", str(exc)) from exc
+
+        if metrics and self._downsample_ms is None:
+            raise BatchError(422, "metric_window_unresolved", "metric window unresolved")
+
+        if metrics:
+            # The retained range spans the downsample windows of every
+            # currently stored sample; a late sample outside it can no longer
+            # be assigned to a retained window.
+            downsample_ms = self._downsample_ms
+            timestamps = [point_key[3] for point_key in self._points]
+            if not timestamps:
+                raise BatchError(
+                    404, "late_metric_out_of_retention", "late metric out of retention"
+                )
+            retention_start = (min(timestamps) // downsample_ms) * downsample_ms
+            retention_end = (max(timestamps) // downsample_ms) * downsample_ms + downsample_ms
+            for metric in metrics:
+                timestamp_ms = metric["timestamp_ms"]
+                if timestamp_ms < retention_start or timestamp_ms >= retention_end:
+                    raise BatchError(
+                        404,
+                        "late_metric_out_of_retention",
+                        "late metric out of retention",
+                    )
+
+        # Deduplicate by the established point identity — within the request
+        # and against the stored winning samples. Any conflicting value is
+        # rejected before anything is applied.
+        unique: dict = {}
+        duplicates = 0
+        for metric in metrics:
+            point_key = (
+                metric["source"],
+                metric["name"],
+                _canonical_labels(metric["labels"]),
+                metric["timestamp_ms"],
+            )
+            known = unique.get(point_key)
+            if known is not None:
+                if known["value"] != metric["value"]:
+                    raise BatchError(400, "late_metric_conflict", "late metric conflict")
+                duplicates += 1
+                continue
+            unique[point_key] = metric
+
+        accepted: dict = {}
+        for point_key, metric in unique.items():
+            winner = self._point_winner(point_key)
+            if winner is None:
+                accepted[point_key] = metric
+                continue
+            _rank, existing = winner
+            if existing["value"] != metric["value"]:
+                raise BatchError(400, "late_metric_conflict", "late metric conflict")
+            # An identical sample is already established: idempotent no-op.
+            duplicates += 1
+
+        affected_streams: set = set()
+        affected_buckets: set = set()
+        for point_key, metric in accepted.items():
+            candidates = self._points.setdefault(point_key, {})
+            candidates[_LATE_RANK] = metric
+            start = (point_key[3] // self._downsample_ms) * self._downsample_ms
+            bucket_key = (point_key[1], point_key[2], start)
+            self._bucket_points.setdefault(bucket_key, set()).add(point_key)
+            affected_streams.add((point_key[1], point_key[2]))
+            affected_buckets.add(bucket_key)
+        for bucket_key in affected_buckets:
+            self._recompute_bucket(bucket_key)
+
+        if accepted and self._window_engine.rules:
+            # Late observations drive the window-suppression engine exactly
+            # like batch events; identical resubmissions never reach here, so
+            # no episode is recorded twice.
+            _feed_window_events(self._window_engine, list(accepted.values()), [])
+
+        return {
+            "accepted": len(accepted),
+            "duplicates": duplicates,
+            "affected_streams": len(affected_streams),
+            "recomputed_windows": len(affected_buckets),
+        }
 
     # -- queries --------------------------------------------------------------
 

@@ -23,6 +23,7 @@ from .core import (
 
 RETRACT_PREFIX = "/v1/metric_batches/"
 RETRACT_SUFFIX = "/retract"
+LATE_METRICS_PATH = "/v1/late_metrics"
 WINDOW_RULES_PATH = "/v1/window_suppression_rules"
 WINDOW_SUPPRESSIONS_PATH = "/v1/window_suppressions"
 SUPPRESSION_AUDIT_PATH = "/v1/suppression_audit"
@@ -64,6 +65,15 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
                 _send_error(self, 400, "invalid_maintenance_window", str(exc))
             except ValueError as exc:  # legacy path validation errors
                 _send_error(self, 400, "invalid_request", str(exc))
+            else:
+                _send_json(self, 200, result)
+
+        def _handle_late_metrics(self) -> None:
+            try:
+                with lock:
+                    result = service.submit_late_metrics(self._read_json())
+            except BatchError as exc:
+                _send_error(self, exc.status, exc.code, str(exc))
             else:
                 _send_json(self, 200, result)
 
@@ -145,6 +155,8 @@ def _make_handler(service: MetricBatchService, lock: threading.Lock):
             path = urlsplit(self.path).path
             if path == "/v1/metric_batches":
                 self._handle_batch()
+            elif path == LATE_METRICS_PATH:
+                self._handle_late_metrics()
             elif path == WINDOW_RULES_PATH:
                 self._handle_window_rules()
             elif path == MAINTENANCE_WINDOWS_PATH:

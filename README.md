@@ -325,7 +325,31 @@ python -m metric_fusion.server --port 8080 --downsample-ms 60000 --suppression-m
 ```
 
 - `POST /v1/metric_batches`：应用批次（无 `batch_id` 时按旧版处理）；`POST /v1/metric_batches/{batch_id}/retract`：撤回批次（请求体可空，若有则须为可识别 JSON）。错误响应为 `{"code": ..., "message": ...}`，状态码如上。
-- `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。`GET /v1/suppression_audit`：返回当前已裁决告警的抑制审计（只读）。
+- `POST /process`：旧版无状态入口。`POST /v1/query`：按 `name/labels/start_ms/end_ms` 查询 series。`GET /v1/series`、`GET /v1/alerts`：全量查询。`GET /v1/suppression_audit`：返回当前已裁决告警的抑制审计（只读）。`POST /v1/late_metrics`：提交迟到样本并重算其所在窗口（见下节）。
+
+## 迟到指标的确定性重算（有状态服务）
+
+`MetricBatchService.submit_late_metrics`（及 `POST /v1/late_metrics`）接收在对应降采样窗口已经结束后才抵达的指标样本，只重算这些样本所在的既有窗口。请求体为样本数组或 `{"metrics": [...]}`；样本沿用既有字段（`source/name/labels/timestamp_ms/value`）与校验。现有指标提交、聚合查询与告警状态入口的结构和语义均不变。
+
+```python
+result = service.submit_late_metrics({
+    "metrics": [
+        {"source": "agent-a", "name": "cpu.usage",
+         "labels": {"host": "db-1"}, "timestamp_ms": 61000, "value": 0.9},
+    ],
+})
+# => {"accepted": 1, "duplicates": 0,
+#     "affected_streams": 1, "recomputed_windows": 1}
+```
+
+- 去重身份沿用既有口径（`source/name/labels/timestamp_ms`）：迟到样本并入既有指标序列，不产生新序列；重算只触及样本时间戳所在的降采样窗口，未受影响窗口的既有结果不变。同一窗口内先后到达的多个不同时间点都保留并一起重新聚合；多个窗口可在一个请求内按任意顺序到达，最终结果只由已接受样本与当前查询配置决定。
+- 重算后后续查询（`query_series`、`GET /v1/series`、`POST /v1/query` 及查询时的 `aggregations`、`source_quorum`、`source_weights`、`source_priority`、`gap_fill`、`downsample_overrides`、`source_outliers`）读取修正后的窗口值、窗口时间与来源贡献；无新输入时同一查询返回一致的修正值。若相关窗口此前触发过告警，`query_alerts()` / `GET /v1/alerts` 按现有告警判断与抑制规则（时间抑制、抑制解释、时间窗规则、维护窗口）重新评估：仍应抑制的保持抑制，不再满足条件的结束告警，重新满足且未被抑制的产生新的告警状态。迟到样本与批次事件一样驱动时间窗抑制引擎。
+- 幂等：相同的迟到事件重复提交（请求内重复或再次提交）结果不变，`accepted` 为 0、`duplicates` 计入重复条数，不重复计数、不重复产生告警。同一身份携带不同指标值属于冲突：整个请求拒绝，HTTP 400，`code` 固定为 `late_metric_conflict`，已成立的窗口结果不被改写。
+- 保留范围：服务当前已存样本所覆盖的降采样窗口区间 `[最早窗口起点, 最晚窗口起点 + downsample_ms)`。样本时间戳落在该范围之外（或服务尚无已存样本）时，整个请求拒绝，HTTP 404，`code` 固定为 `late_metric_out_of_retention`；迟到样本本身不扩展保留范围。时间戳缺失或无法解析（非数值、非有限、为负）时整个请求拒绝，HTTP 400，`code` 固定为 `late_metric_invalid`；服务未配置 `downsample_ms` 时无法确定窗口归属，拒绝为 HTTP 422，`code` 固定为 `metric_window_unresolved`。
+- 所有校验（结构、时间戳、保留范围、冲突）在任何状态变更之前完成，失败为整批拒绝，不修改聚合结果或告警状态。响应字段：`accepted`（新接受的样本数）、`duplicates`（因完全相同而被跳过的样本数）、`affected_streams` 与 `recomputed_windows`（口径与批次应用一致）。
+- 与批次的交互：迟到样本作为该数据点的最低秩候选参与既有胜者解析——之后的批次仍按批次秩 `(max_event_time_ms, batch_id)` 正常修正该点，批次撤回后迟到值可按既有秩语义恢复为胜者；`service.reset()` 一并清空迟到样本。批次应用/撤回请求的结构、幂等与错误映射不变，也不携带迟到语义。
+
+HTTP：`POST /v1/late_metrics`，请求体为样本数组或 `{"metrics": [...]}`；成功返回 200 与上述响应字段，错误响应为 `{"code": ..., "message": ...}`，状态码如上。
 
 ## 约定
 
