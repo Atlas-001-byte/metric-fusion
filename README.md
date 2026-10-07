@@ -137,6 +137,20 @@ python -m metric_fusion request.json > result.json
 - 有状态服务在补丁、迟到修正或撤回后重新查询时，从当前胜者样本重新过滤，批次顺序不影响结果。
 - 校验：`source_outliers` 必须是精确指标名到配置对象的映射，键非空，对象只能含 `min_sources` 与 `tolerance`；`min_sources` 为非布尔整数且至少为 2，`tolerance` 为有限非布尔数且不小于 0。非法时库调用抛 `ValueError("invalid source_outliers")`，`POST /process` 与 `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_outliers"}`，CLI 输出 `invalid source_outliers` 并以 2 退出。校验失败不产生部分效果。
 
+## 按来源新鲜度排除陈旧读数（可选）
+
+`process`、`POST /process`、`POST /v1/query` 与 `MetricBatchService.query_series` 接受可选的 `source_lag_tolerance_ms` 映射：键为精确指标名，值为非负整数毫秒容差。命中指标在多源去重、窗口聚合、来源权重与优先级、法定人数、缺口补点、数值离群过滤和有状态批次修正之上，按来源新鲜度排除陈旧读数。未提供、`None`、空映射或指标名未命中映射时，既有结果逐字段不变。
+
+```json
+"source_lag_tolerance_ms": {"cpu.usage": 100}
+```
+
+- 指标仍按 `source/name/labels/timestamp_ms` 后覆盖先去重，并按既有周期（`downsample_ms` 或 `downsample_overrides` 对应周期）划分 `name` 加规范 labels 的窗口；新鲜度过滤在每个窗口内独立进行，且先于 `source_outliers`。
+- 窗口内以各来源去重样本中的最大 `timestamp_ms` 为**来源锚点**，取所有来源锚点的最大值为**窗口锚点**；当 `窗口锚点 - 来源锚点` **严格大于**容差时，该来源在该窗口的整组样本剔除；差值恰好等于容差时保留。容差为 0 时只保留拥有最新读数的来源（时间戳并列的来源都保留）。
+- 剔除随后执行既有 `source_outliers`、聚合函数、`source_weights` 或 `source_priority`、`source_quorum` 与 `gap_fill`：`value`、`count`、`sources`、`priority_missing`、补点行、排序以及 `round(value, 6)` 与 `-0.0` 归一都只依据保留样本。优先级来源全部陈旧但窗口内仍有其他来源时，输出 `priority_missing` 行；剔除后保留来源不足 `source_quorum` 的窗口不输出，也不会被补点恢复。
+- 仅影响 series 查询；批次应用、批次撤回、迟到指标提交、告警查询、告警抑制（时间抑制、抑制解释、时间窗规则、维护窗口）以及 `GET /v1/series`、`GET /v1/alerts` 均不读取该配置。有状态服务在补丁、迟到修正或撤回后重新查询时，从当前胜者样本重新计算锚点与剔除，无新输入时重复查询结果一致。
+- 校验：`source_lag_tolerance_ms` 必须是精确指标名到非负非布尔整数的映射；请求不是对象、键为空串、值为负数、浮点数、布尔值、字符串或 null 均属非法。非法时库调用抛 `ValueError("invalid source_freshness")`，`POST /process` 与 `POST /v1/query` 返回 400，`{"code": "invalid_request", "message": "invalid source_freshness"}`，CLI 输出 `invalid source_freshness` 并以 2 退出。校验在任何状态变更前完成（全有或全无），失败不产生部分效果。
+
 ## 抑制解释（可选开启）
 
 请求中加 `"enable_explanations": true`（默认 `false`）与 `suppression_rules` 后启用。默认关闭时输出、抑制结果与异常行为与上述基线完全一致，且不会读取或校验规则配置。
@@ -343,7 +357,7 @@ result = service.submit_late_metrics({
 ```
 
 - 去重身份沿用既有口径（`source/name/labels/timestamp_ms`）：迟到样本并入既有指标序列，不产生新序列；重算只触及样本时间戳所在的降采样窗口，未受影响窗口的既有结果不变。同一窗口内先后到达的多个不同时间点都保留并一起重新聚合；多个窗口可在一个请求内按任意顺序到达，最终结果只由已接受样本与当前查询配置决定。
-- 重算后后续查询（`query_series`、`GET /v1/series`、`POST /v1/query` 及查询时的 `aggregations`、`source_quorum`、`source_weights`、`source_priority`、`gap_fill`、`downsample_overrides`、`source_outliers`）读取修正后的窗口值、窗口时间与来源贡献；无新输入时同一查询返回一致的修正值。若相关窗口此前触发过告警，`query_alerts()` / `GET /v1/alerts` 按现有告警判断与抑制规则（时间抑制、抑制解释、时间窗规则、维护窗口）重新评估：仍应抑制的保持抑制，不再满足条件的结束告警，重新满足且未被抑制的产生新的告警状态。迟到样本与批次事件一样驱动时间窗抑制引擎。
+- 重算后后续查询（`query_series`、`GET /v1/series`、`POST /v1/query` 及查询时的 `aggregations`、`source_quorum`、`source_weights`、`source_priority`、`gap_fill`、`downsample_overrides`、`source_outliers`、`source_lag_tolerance_ms`）读取修正后的窗口值、窗口时间与来源贡献；无新输入时同一查询返回一致的修正值。若相关窗口此前触发过告警，`query_alerts()` / `GET /v1/alerts` 按现有告警判断与抑制规则（时间抑制、抑制解释、时间窗规则、维护窗口）重新评估：仍应抑制的保持抑制，不再满足条件的结束告警，重新满足且未被抑制的产生新的告警状态。迟到样本与批次事件一样驱动时间窗抑制引擎。
 - 幂等：相同的迟到事件重复提交（请求内重复或再次提交）结果不变，`accepted` 为 0、`duplicates` 计入重复条数，不重复计数、不重复产生告警。同一身份携带不同指标值属于冲突：整个请求拒绝，HTTP 400，`code` 固定为 `late_metric_conflict`，已成立的窗口结果不被改写。
 - 保留范围：服务当前已存样本所覆盖的降采样窗口区间 `[最早窗口起点, 最晚窗口起点 + downsample_ms)`。样本时间戳落在该范围之外（或服务尚无已存样本）时，整个请求拒绝，HTTP 404，`code` 固定为 `late_metric_out_of_retention`；迟到样本本身不扩展保留范围。时间戳缺失或无法解析（非数值、非有限、为负）时整个请求拒绝，HTTP 400，`code` 固定为 `late_metric_invalid`；服务未配置 `downsample_ms` 时无法确定窗口归属，拒绝为 HTTP 422，`code` 固定为 `metric_window_unresolved`。
 - 所有校验（结构、时间戳、保留范围、冲突）在任何状态变更之前完成，失败为整批拒绝，不修改聚合结果或告警状态。响应字段：`accepted`（新接受的样本数）、`duplicates`（因完全相同而被跳过的样本数）、`affected_streams` 与 `recomputed_windows`（口径与批次应用一致）。

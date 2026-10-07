@@ -292,6 +292,28 @@ def _validate_source_priority(raw: Any) -> dict:
     return validated
 
 
+def _validate_source_freshness(raw: Any) -> dict:
+    """Validate a ``source_lag_tolerance_ms`` mapping of exact metric name to lag.
+
+    Returns ``{}`` for an absent/None/empty mapping (no source is excluded for
+    staleness). Keys must be non-empty strings and values non-negative,
+    non-boolean integers. Anything invalid raises
+    ``ValueError("invalid source_freshness")``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid source_freshness")
+    validated: dict = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key != ""):
+            raise ValueError("invalid source_freshness")
+        if not (_is_int(value) and value >= 0):
+            raise ValueError("invalid source_freshness")
+        validated[key] = value
+    return validated
+
+
 def _new_bucket() -> dict:
     return {
         "sum": 0.0,
@@ -382,6 +404,47 @@ def _filter_source_outliers(bucket: dict, min_sources: int, tolerance: Any) -> d
         if abs(representatives[source] - median) <= tolerance
     ]
     if len(kept) == len(sources):
+        return bucket
+    filtered = _new_bucket()
+    for source in sorted(kept):
+        stats = bucket["per_source"][source]
+        filtered["sum"] += stats[0]
+        filtered["count"] += stats[1]
+        filtered["sources"].add(source)
+        filtered["values"].extend(stats[5])
+        filtered["per_source"][source] = stats
+        if filtered["min"] is None or stats[2] < filtered["min"]:
+            filtered["min"] = stats[2]
+        if filtered["max"] is None or stats[3] > filtered["max"]:
+            filtered["max"] = stats[3]
+        last = filtered["last"]
+        # Same tie rule as _bucket_add: greatest timestamp, then the
+        # lexicographically greatest source.
+        if last is None or (stats[4][0], source) > (last[0], last[1]):
+            filtered["last"] = (stats[4][0], source, stats[4][1])
+    return filtered
+
+
+def _filter_stale_sources(bucket: dict, tolerance_ms: int) -> dict:
+    """Return the bucket with stale source groups removed (never mutates).
+
+    Each source's anchor is the greatest ``timestamp_ms`` among its
+    deduplicated window samples; the window anchor is the greatest source
+    anchor. A source whose lag ``window_anchor - source_anchor`` is strictly
+    greater than ``tolerance_ms`` is dropped as a whole — a lag exactly equal
+    to the tolerance is kept. When nothing is filtered the original bucket is
+    returned unchanged.
+    """
+    anchors = {
+        source: bucket["per_source"][source][4][0] for source in bucket["sources"]
+    }
+    window_anchor = max(anchors.values())
+    kept = [
+        source
+        for source in bucket["sources"]
+        if window_anchor - anchors[source] <= tolerance_ms
+    ]
+    if len(kept) == len(bucket["sources"]):
         return bucket
     filtered = _new_bucket()
     for source in sorted(kept):
@@ -589,6 +652,7 @@ def _downsample(
     gap_fill: dict | None = None,
     downsample_overrides: dict | None = None,
     source_outliers: dict | None = None,
+    source_lag_tolerance: dict | None = None,
 ) -> list:
     # Deduplicate identical points (same source/name/labels/timestamp):
     # the later occurrence wins.
@@ -623,6 +687,17 @@ def _downsample(
     quorum_blocked: set = set()
     for name, labels_key, start in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
         bucket = buckets[(name, labels_key, start)]
+        # Stale-source exclusion runs on the deduplicated window first: each
+        # source's anchor is its greatest sample timestamp and the window
+        # anchor is the greatest source anchor; a source lagging by strictly
+        # more than its tolerance is removed before outlier filtering,
+        # aggregation, weighting, failover or the quorum decision. A window
+        # whose sources are all stale produces no row at all.
+        lag_tolerance = source_lag_tolerance.get(name) if source_lag_tolerance else None
+        if lag_tolerance is not None:
+            bucket = _filter_stale_sources(bucket, lag_tolerance)
+            if bucket["count"] == 0:
+                continue
         # Source-outlier filtering runs on the deduplicated window before any
         # aggregation, weighting, failover or quorum decision; a window whose
         # samples are all filtered out produces no row at all.
@@ -1556,6 +1631,15 @@ def process(
     # configuration. Metrics absent from the mapping are unaffected.
     source_outliers = _validate_source_outliers(request.get("source_outliers"))
 
+    # Optional per-metric source-freshness lag tolerances; validated up front
+    # (all or nothing) like every other optional query configuration. A source
+    # whose greatest window-sample timestamp lags the window anchor by strictly
+    # more than its tolerance is excluded from the window. Metrics absent from
+    # the mapping are unaffected.
+    source_lag_tolerance = _validate_source_freshness(
+        request.get("source_lag_tolerance_ms")
+    )
+
     # The explanation subsystem is fully dormant unless explicitly enabled,
     # so legacy inputs, outputs and error behavior stay untouched.
     enabled_raw = request.get("enable_explanations", False)
@@ -1611,6 +1695,7 @@ def process(
         gap_fill,
         downsample_overrides,
         source_outliers,
+        source_lag_tolerance,
     )
 
     window_suppressed_ids: set = set()
@@ -2235,6 +2320,7 @@ class MetricBatchService:
         gap_fill: dict | None = None,
         downsample_overrides: dict | None = None,
         source_outliers: dict | None = None,
+        source_lag_tolerance_ms: dict | None = None,
     ) -> list:
         """Return current downsampled windows in the established output shape.
 
@@ -2285,6 +2371,14 @@ class MetricBatchService:
         samples on every query. Metrics absent from the mapping are
         unaffected. Output rows keep the existing fields and the existing
         (name, labels, timestamp) order.
+        ``source_lag_tolerance_ms`` maps exact metric names to non-negative
+        integer milliseconds: within each window of a listed metric each
+        source's anchor is the greatest timestamp of its deduplicated winning
+        samples, the window anchor is the greatest source anchor, and a source
+        whose anchor lags the window anchor by strictly more than the
+        tolerance is dropped as a whole before outlier filtering, aggregation,
+        weighting, failover, quorum and gap filling; a lag exactly equal to
+        the tolerance is kept. Metrics absent from the mapping are unaffected.
         """
         if name is not None and not isinstance(name, str):
             raise ValueError("invalid name")
@@ -2302,6 +2396,7 @@ class MetricBatchService:
         gap_fill_map = _validate_gap_fill(gap_fill)
         override_map = _validate_downsample_overrides(downsample_overrides)
         outliers_map = _validate_source_outliers(source_outliers)
+        freshness_map = _validate_source_freshness(source_lag_tolerance_ms)
 
         if override_map:
             # Metrics with an override are re-windowed from the current
@@ -2345,6 +2440,15 @@ class MetricBatchService:
                 continue
             if end_ms is not None and start > end_ms:
                 continue
+            # Stale-source exclusion runs on the window's current winning
+            # samples before outlier filtering, coverage, aggregation,
+            # weighting or failover; a window whose sources are all stale
+            # produces no row.
+            lag_tolerance = freshness_map.get(bucket_name)
+            if lag_tolerance is not None:
+                bucket = _filter_stale_sources(bucket, lag_tolerance)
+                if bucket["count"] == 0:
+                    continue
             # Source-outlier filtering runs on the window's current winning
             # samples before coverage, aggregation, weighting or failover;
             # a window whose samples are all filtered out produces no row.
